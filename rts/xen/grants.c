@@ -236,14 +236,14 @@ static long end_grant_v1(grant_ref_t gref)
   if(gref >= V1_NUM_ENTRIES)
     return -EINVAL;
 
+  flags = v1_grant_table[gref].flags;
   do {
-    flags = v1_grant_table[gref].flags;
     if(flags & (GTF_reading | GTF_writing))
       return -EAGAIN;
     done =
       __atomic_compare_exchange_n(&v1_grant_table[gref].flags, &flags, 0,
                                   0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-  } while(done);
+  } while(!done);
 
   return 1;
 }
