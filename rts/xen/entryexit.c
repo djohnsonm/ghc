@@ -147,7 +147,7 @@ void runtime_entry(start_info_t *start_info, void *init_sp)
   argv[argc++] = "-c";
   /* tell GHC how much memory to use */
   argv[argc] = malloc(16);
-  snprintf(argv[argc],16,"-M%dm", (maxpages - used_frames()) / 256);
+  snprintf(argv[argc],16,"-M%dm", (maxpages - used_frames() - 128) / 256);
   argc++;
 #ifdef THREADED_RTS
   argv[argc++] = "-N";
