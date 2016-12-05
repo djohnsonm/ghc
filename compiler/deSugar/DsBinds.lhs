@@ -14,7 +14,7 @@ lower levels it is preserved with @let@/@letrec@s).
 -- The above warning supression flag is a temporary kludge.
 -- While working on this module you are encouraged to remove it and
 -- detab the module (please do the detabbing in a separate patch). See
---     http://hackage.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
 -- for details
 
 module DsBinds ( dsTopLHsBinds, dsLHsBinds, decomposeRuleLhs, dsSpec,
@@ -49,7 +49,7 @@ import TcEvidence
 import TcType
 import Type
 import Coercion hiding (substCo)
-import TysWiredIn ( eqBoxDataCon, tupleCon )
+import TysWiredIn ( eqBoxDataCon, coercibleDataCon, tupleCon )
 import Id
 import Class
 import DataCon	( dataConWorkId )
@@ -96,8 +96,7 @@ ds_lhs_binds binds = do { ds_bs <- mapBagM dsLHsBind binds
                         ; return (foldBag appOL id nilOL ds_bs) }
 
 dsLHsBind :: LHsBind Id -> DsM (OrdList (Id,CoreExpr))
-dsLHsBind (L loc bind)
-  = putSrcSpanDs loc $ dsHsBind bind
+dsLHsBind (L loc bind) = putSrcSpanDs loc $ dsHsBind bind
 
 dsHsBind :: HsBind Id -> DsM (OrdList (Id,CoreExpr))
 
@@ -210,6 +209,8 @@ dsHsBind (AbsBinds { abs_tvs = tyvars, abs_ev_vars = dicts
 
     add_inline :: Id -> Id    -- tran
     add_inline lcl_id = lookupVarEnv inline_env lcl_id `orElse` lcl_id
+
+dsHsBind (PatSynBind{}) = panic "dsHsBind: PatSynBind"
 
 ------------------------
 makeCorePair :: DynFlags -> Id -> Bool -> Arity -> CoreExpr -> (Id, CoreExpr)
@@ -574,10 +575,10 @@ SPEC f :: ty                [n]   INLINE [k]
 
 \begin{code}
 decomposeRuleLhs :: [Var] -> CoreExpr -> Either SDoc ([Var], Id, [CoreExpr])
--- Take apart the LHS of a RULE.  It's supposed to look like
---     /\a. f a Int dOrdInt
--- or  /\a.\d:Ord a. let { dl::Ord [a] = dOrdList a d } in f [a] dl
--- That is, the RULE binders are lambda-bound
+-- (decomposeRuleLhs bndrs lhs) takes apart the LHS of a RULE,
+-- The 'bndrs' are the quantified binders of the rules, but decomposeRuleLhs
+-- may add some extra dictionary binders (see Note [Constant rule dicts])
+--
 -- Returns Nothing if the LHS isn't of the expected shape
 decomposeRuleLhs bndrs lhs 
   =  -- Note [Simplifying the left-hand side of a RULE]
@@ -705,7 +706,8 @@ dsHsWrapper (WpTyApp ty)      e = return $ App e (Type ty)
 dsHsWrapper (WpLet ev_binds)  e = do bs <- dsTcEvBinds ev_binds
                                      return (mkCoreLets bs e)
 dsHsWrapper (WpCompose c1 c2) e = dsHsWrapper c1 =<< dsHsWrapper c2 e
-dsHsWrapper (WpCast co)       e = dsTcCoercion co (mkCast e) 
+dsHsWrapper (WpCast co)       e = ASSERT(tcCoercionRole co == Representational)
+                                  dsTcCoercion co (mkCast e)
 dsHsWrapper (WpEvLam ev)      e = return $ Lam ev e 
 dsHsWrapper (WpTyLam tv)      e = return $ Lam tv e 
 dsHsWrapper (WpEvApp evtrm)   e = liftM (App e) (dsEvTerm evtrm)
@@ -792,6 +794,7 @@ dsTcCoercion :: TcCoercion -> (Coercion -> CoreExpr) -> DsM CoreExpr
 --       = case g1 of EqBox g1# ->
 --         case g2 of EqBox g2# ->
 --         k (trans g1# g2#)
+-- thing_inside will get a coercion at the role requested
 dsTcCoercion co thing_inside
   = do { us <- newUniqueSupply
        ; let eqvs_covs :: [(EqVar,CoVar)]
@@ -810,36 +813,43 @@ dsTcCoercion co thing_inside
          eq_nm = idName eqv
          occ = nameOccName eq_nm
          loc = nameSrcSpan eq_nm
-         ty  = mkCoercionType ty1 ty2
+         ty  = mkCoercionType (getEqPredRole (evVarPred eqv)) ty1 ty2
          (ty1, ty2) = getEqPredTys (evVarPred eqv)
 
-    wrap_in_case result_ty (eqv, cov) body 
-      = Case (Var eqv) eqv result_ty [(DataAlt eqBoxDataCon, [cov], body)]
+    wrap_in_case result_ty (eqv, cov) body
+      = case getEqPredRole (evVarPred eqv) of
+         Nominal          -> Case (Var eqv) eqv result_ty [(DataAlt eqBoxDataCon, [cov], body)]
+         Representational -> Case (Var eqv) eqv result_ty [(DataAlt coercibleDataCon, [cov], body)]
+         Phantom          -> panic "wrap_in_case/phantom"
 
 ds_tc_coercion :: CvSubst -> TcCoercion -> Coercion
--- If the incoming TcCoercion if of type (a ~ b), 
---                 the result is of type (a ~# b)
--- The VarEnv maps EqVars of type (a ~ b) to Coercions of type (a ~# b)
+-- If the incoming TcCoercion if of type (a ~ b)   (resp.  Coercible a b)
+--                 the result is of type (a ~# b)  (reps.  a ~# b)
+-- The VarEnv maps EqVars of type (a ~ b) to Coercions of type (a ~# b) (resp. and so on)
 -- No need for InScope set etc because the 
 ds_tc_coercion subst tc_co
   = go tc_co
   where
-    go (TcRefl ty)            = Refl (Coercion.substTy subst ty)
-    go (TcTyConAppCo tc cos)  = mkTyConAppCo tc (map go cos)
-    go (TcAppCo co1 co2)      = mkAppCo (go co1) (go co2)
-    go (TcForAllCo tv co)     = mkForAllCo tv' (ds_tc_coercion subst' co)
+    go (TcRefl r ty)            = Refl r (Coercion.substTy subst ty)
+    go (TcTyConAppCo r tc cos)  = mkTyConAppCo r tc (map go cos)
+    go (TcAppCo co1 co2)        = let leftCo    = go co1
+                                      rightRole = nextRole leftCo in
+                                  mkAppCoFlexible leftCo rightRole (go co2)
+    go (TcForAllCo tv co)       = mkForAllCo tv' (ds_tc_coercion subst' co)
                               where
                                 (subst', tv') = Coercion.substTyVarBndr subst tv
-    go (TcAxiomInstCo ax ind tys)
-                              = mkAxInstCo ax ind (map (Coercion.substTy subst) tys)
-    go (TcSymCo co)           = mkSymCo (go co)
-    go (TcTransCo co1 co2)    = mkTransCo (go co1) (go co2)
-    go (TcNthCo n co)         = mkNthCo n (go co)
-    go (TcLRCo lr co)         = mkLRCo lr (go co)
-    go (TcInstCo co ty)       = mkInstCo (go co) ty
-    go (TcLetCo bs co)        = ds_tc_coercion (ds_co_binds bs) co
-    go (TcCastCo co1 co2)     = mkCoCast (go co1) (go co2)
-    go (TcCoVarCo v)          = ds_ev_id subst v
+    go (TcAxiomInstCo ax ind cos)
+                                = AxiomInstCo ax ind (map go cos)
+    go (TcPhantomCo ty1 ty2)    = UnivCo Phantom ty1 ty2
+    go (TcSymCo co)             = mkSymCo (go co)
+    go (TcTransCo co1 co2)      = mkTransCo (go co1) (go co2)
+    go (TcNthCo n co)           = mkNthCo n (go co)
+    go (TcLRCo lr co)           = mkLRCo lr (go co)
+    go (TcSubCo co)             = mkSubCo (go co)
+    go (TcLetCo bs co)          = ds_tc_coercion (ds_co_binds bs) co
+    go (TcCastCo co1 co2)       = mkCoCast (go co1) (go co2)
+    go (TcCoVarCo v)            = ds_ev_id subst v
+    go (TcAxiomRuleCo co ts cs) = AxiomRuleCo co (map (Coercion.substTy subst) ts) (map go cs)
 
     ds_co_binds :: TcEvBinds -> CvSubst
     ds_co_binds (EvBinds bs)      = foldl ds_scc subst (sccEvBinds bs)

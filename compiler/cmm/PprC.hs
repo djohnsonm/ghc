@@ -52,9 +52,11 @@ import Data.Map (Map)
 import Data.Word
 import System.IO
 import qualified Data.Map as Map
+import Control.Monad (liftM, ap)
+import Control.Applicative (Applicative(..))
 
-import Data.Array.Unsafe ( castSTUArray )
-import Data.Array.ST hiding ( castSTUArray )
+import qualified Data.Array.Unsafe as U ( castSTUArray )
+import Data.Array.ST
 
 -- --------------------------------------------------------------------------
 -- Top level
@@ -219,6 +221,7 @@ pprStmt stmt =
                         -- for a dynamic call, no declaration is necessary.
 
     CmmUnsafeForeignCall (PrimTarget MO_Touch) _results _args -> empty
+    CmmUnsafeForeignCall (PrimTarget (MO_Prefetch_Data _)) _results _args -> empty
 
     CmmUnsafeForeignCall target@(PrimTarget op) results args ->
         fn_call
@@ -649,6 +652,15 @@ pprMachOp_for_C mop = case mop of
                                 (panic $ "PprC.pprMachOp_for_C: MO_VS_Neg"
                                       ++ " should have been handled earlier!")
 
+        MO_VU_Quot {}     -> pprTrace "offending mop:"
+                                (ptext $ sLit "MO_VU_Quot")
+                                (panic $ "PprC.pprMachOp_for_C: MO_VU_Quot"
+                                      ++ " should have been handled earlier!")
+        MO_VU_Rem {}      -> pprTrace "offending mop:"
+                                (ptext $ sLit "MO_VU_Rem")
+                                (panic $ "PprC.pprMachOp_for_C: MO_VU_Rem"
+                                      ++ " should have been handled earlier!")
+
         MO_VF_Insert {}   -> pprTrace "offending mop:"
                                 (ptext $ sLit "MO_VF_Insert")
                                 (panic $ "PprC.pprMachOp_for_C: MO_VF_Insert"
@@ -738,6 +750,7 @@ pprCallishMachOp_for_C mop
         MO_Memcpy       -> ptext (sLit "memcpy")
         MO_Memset       -> ptext (sLit "memset")
         MO_Memmove      -> ptext (sLit "memmove")
+        (MO_BSwap w)    -> ptext (sLit $ bSwapLabel w)
         (MO_PopCnt w)   -> ptext (sLit $ popCntLabel w)
         (MO_UF_Conv w)  -> ptext (sLit $ word2FloatLabel w)
 
@@ -747,7 +760,9 @@ pprCallishMachOp_for_C mop
         MO_Add2       {} -> unsupported
         MO_U_Mul2     {} -> unsupported
         MO_Touch         -> unsupported
-        MO_Prefetch_Data -> unsupported
+        (MO_Prefetch_Data _ ) -> unsupported
+        --- we could support prefetch via "__builtin_prefetch"
+        --- Not adding it for now
     where unsupported = panic ("pprCallishMachOp_for_C: " ++ show mop
                             ++ " not supported!")
 
@@ -937,6 +952,7 @@ is_cishCC CCallConv    = True
 is_cishCC CApiConv     = True
 is_cishCC StdCallConv  = True
 is_cishCC PrimCallConv = False
+is_cishCC JavaScriptCallConv = False
 
 -- ---------------------------------------------------------------------
 -- Find and print local and external declarations for a list of
@@ -983,6 +999,13 @@ pprExternDecl _in_srt lbl
 
 type TEState = (UniqSet LocalReg, Map CLabel ())
 newtype TE a = TE { unTE :: TEState -> (a, TEState) }
+
+instance Functor TE where
+      fmap = liftM
+
+instance Applicative TE where
+      pure = return
+      (<*>) = ap
 
 instance Monad TE where
    TE m >>= k  = TE $ \s -> case m s of (a, s') -> unTE (k a) s'
@@ -1140,10 +1163,10 @@ big_doubles dflags
   | otherwise = panic "big_doubles"
 
 castFloatToIntArray :: STUArray s Int Float -> ST s (STUArray s Int Int)
-castFloatToIntArray = castSTUArray
+castFloatToIntArray = U.castSTUArray
 
 castDoubleToIntArray :: STUArray s Int Double -> ST s (STUArray s Int Int)
-castDoubleToIntArray = castSTUArray
+castDoubleToIntArray = U.castSTUArray
 
 -- floats are always 1 word
 floatToWord :: DynFlags -> Rational -> CmmLit
@@ -1191,8 +1214,9 @@ commafy xs = hsep $ punctuate comma xs
 pprHexVal :: Integer -> Width -> SDoc
 pprHexVal 0 _ = ptext (sLit "0x0")
 pprHexVal w rep
-  | w < 0     = parens (char '-' <> ptext (sLit "0x") <> go (-w) <> repsuffix rep)
-  | otherwise = ptext (sLit "0x") <> go w <> repsuffix rep
+  | w < 0     = parens (char '-' <>
+                    ptext (sLit "0x") <> intToDoc (-w) <> repsuffix rep)
+  | otherwise =     ptext (sLit "0x") <> intToDoc   w  <> repsuffix rep
   where
         -- type suffix for literals:
         -- Integer literals are unsigned in Cmm/C.  We explicitly cast to
@@ -1207,10 +1231,33 @@ pprHexVal w rep
           else panic "pprHexVal: Can't find a 64-bit type"
       repsuffix _ = char 'U'
 
+      intToDoc :: Integer -> SDoc
+      intToDoc i = go (truncInt i)
+
+      -- We need to truncate value as Cmm backend does not drop
+      -- redundant bits to ease handling of negative values.
+      -- Thus the following Cmm code on 64-bit arch, like amd64:
+      --     CInt v;
+      --     v = {something};
+      --     if (v == %lobits32(-1)) { ...
+      -- leads to the following C code:
+      --     StgWord64 v = (StgWord32)({something});
+      --     if (v == 0xFFFFffffFFFFffffU) { ...
+      -- Such code is incorrect as it promotes both operands to StgWord64
+      -- and the whole condition is always false.
+      truncInt :: Integer -> Integer
+      truncInt i =
+          case rep of
+              W8  -> i `rem` (2^(8 :: Int))
+              W16 -> i `rem` (2^(16 :: Int))
+              W32 -> i `rem` (2^(32 :: Int))
+              W64 -> i `rem` (2^(64 :: Int))
+              _   -> panic ("pprHexVal/truncInt: C backend can't encode "
+                            ++ show rep ++ " literals")
+
       go 0 = empty
       go w' = go q <> dig
            where
              (q,r) = w' `quotRem` 16
              dig | r < 10    = char (chr (fromInteger r + ord '0'))
                  | otherwise = char (chr (fromInteger r - 10 + ord 'a'))
-

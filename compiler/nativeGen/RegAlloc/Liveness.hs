@@ -40,7 +40,6 @@ import Digraph
 import DynFlags
 import Outputable
 import Platform
-import Unique
 import UniqSet
 import UniqFM
 import UniqSupply
@@ -164,10 +163,11 @@ data Liveness
 -- | Stash regs live on entry to each basic block in the info part of the cmm code.
 data LiveInfo
         = LiveInfo
-                (BlockEnv CmmStatics)                   -- cmm info table static stuff
-                (Maybe BlockId)                         -- id of the first block
-                (Maybe (BlockMap RegSet))               -- argument locals live on entry to this block
-                (Map BlockId (Set Int))                 -- stack slots live on entry to this block
+                (BlockEnv CmmStatics)     -- cmm info table static stuff
+                [BlockId]                 -- entry points (first one is the
+                                          -- entry point for the proc).
+                (Maybe (BlockMap RegSet)) -- argument locals live on entry to this block
+                (Map BlockId (Set Int))   -- stack slots live on entry to this block
 
 
 -- | A basic block with liveness information.
@@ -218,9 +218,9 @@ instance Outputable instr
                  | otherwise            = name <> (hcat $ punctuate space $ map ppr $ uniqSetToList regs)
 
 instance Outputable LiveInfo where
-    ppr (LiveInfo mb_static firstId liveVRegsOnEntry liveSlotsOnEntry)
+    ppr (LiveInfo mb_static entryIds liveVRegsOnEntry liveSlotsOnEntry)
         =  (ppr mb_static)
-        $$ text "# firstId          = " <> ppr firstId
+        $$ text "# entryIds         = " <> ppr entryIds
         $$ text "# liveVRegsOnEntry = " <> ppr liveVRegsOnEntry
         $$ text "# liveSlotsOnEntry = " <> text (show liveSlotsOnEntry)
 
@@ -475,7 +475,7 @@ stripLive dflags live
  where  stripCmm :: (Outputable statics, Outputable instr, Instruction instr)
                  => LiveCmmDecl statics instr -> NatCmmDecl statics instr
         stripCmm (CmmData sec ds)       = CmmData sec ds
-        stripCmm (CmmProc (LiveInfo info (Just first_id) _ _) label live sccs)
+        stripCmm (CmmProc (LiveInfo info (first_id:_) _ _) label live sccs)
          = let  final_blocks    = flattenSCCs sccs
 
                 -- make sure the block that was first in the input list
@@ -488,7 +488,7 @@ stripLive dflags live
                           (ListGraph $ map (stripLiveBlock dflags) $ first' : rest')
 
         -- procs used for stg_split_markers don't contain any blocks, and have no first_id.
-        stripCmm (CmmProc (LiveInfo info Nothing _ _) label live [])
+        stripCmm (CmmProc (LiveInfo info [] _ _) label live [])
          =      CmmProc info label live (ListGraph [])
 
         -- If the proc has blocks but we don't know what the first one was, then we're dead.
@@ -636,33 +636,69 @@ natCmmTopToLive (CmmData i d)
         = CmmData i d
 
 natCmmTopToLive (CmmProc info lbl live (ListGraph []))
-        = CmmProc (LiveInfo info Nothing Nothing Map.empty) lbl live []
+        = CmmProc (LiveInfo info [] Nothing Map.empty) lbl live []
 
-natCmmTopToLive (CmmProc info lbl live (ListGraph blocks@(first : _)))
+natCmmTopToLive proc@(CmmProc info lbl live (ListGraph blocks@(first : _)))
  = let  first_id        = blockId first
-        sccs            = sccBlocks blocks
+        all_entry_ids   = entryBlocks proc
+        sccs            = sccBlocks blocks all_entry_ids
+        entry_ids       = filter (/= first_id) all_entry_ids
         sccsLive        = map (fmap (\(BasicBlock l instrs) ->
                                         BasicBlock l (map (\i -> LiveInstr (Instr i) Nothing) instrs)))
                         $ sccs
 
-   in   CmmProc (LiveInfo info (Just first_id) Nothing Map.empty) lbl live sccsLive
+   in   CmmProc (LiveInfo info (first_id : entry_ids) Nothing Map.empty)
+                lbl live sccsLive
 
 
+--
+-- Compute the liveness graph of the set of basic blocks.  Important:
+-- we also discard any unreachable code here, starting from the entry
+-- points (the first block in the list, and any blocks with info
+-- tables).  Unreachable code arises when code blocks are orphaned in
+-- earlier optimisation passes, and may confuse the register allocator
+-- by referring to registers that are not initialised.  It's easy to
+-- discard the unreachable code as part of the SCC pass, so that's
+-- exactly what we do. (#7574)
+--
 sccBlocks
         :: Instruction instr
         => [NatBasicBlock instr]
+        -> [BlockId]
         -> [SCC (NatBasicBlock instr)]
 
-sccBlocks blocks = stronglyConnCompFromEdgedVertices graph
+sccBlocks blocks entries = map (fmap get_node) sccs
   where
+        -- nodes :: [(NatBasicBlock instr, Unique, [Unique])]
+        nodes = [ (block, id, getOutEdges instrs)
+                | block@(BasicBlock id instrs) <- blocks ]
+
+        g1 = graphFromEdgedVertices nodes
+
+        reachable :: BlockSet
+        reachable = setFromList [ id | (_,id,_) <- reachablesG g1 roots ]
+
+        g2 = graphFromEdgedVertices [ node | node@(_,id,_) <- nodes
+                                           , id `setMember` reachable ]
+
+        sccs = stronglyConnCompG g2
+
+        get_node (n, _, _) = n
+
         getOutEdges :: Instruction instr => [instr] -> [BlockId]
         getOutEdges instrs = concat $ map jumpDestsOfInstr instrs
 
-        graph = [ (block, getUnique id, map getUnique (getOutEdges instrs))
-                | block@(BasicBlock id instrs) <- blocks ]
+        -- This is truly ugly, but I don't see a good alternative.
+        -- Digraph just has the wrong API.  We want to identify nodes
+        -- by their keys (BlockId), but Digraph requires the whole
+        -- node: (NatBasicBlock, BlockId, [BlockId]).  This takes
+        -- advantage of the fact that Digraph only looks at the key,
+        -- even though it asks for the whole triple.
+        roots = [(panic "sccBlocks",b,panic "sccBlocks") | b <- entries ]
 
 
----------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
 -- Annotate code with register liveness information
 --
 regLiveness

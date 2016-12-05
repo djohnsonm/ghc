@@ -13,7 +13,7 @@ module TyCon(
 
         AlgTyConRhs(..), visibleDataCons,
         TyConParent(..), isNoParent,
-        SynTyConRhs(..), 
+        SynTyConRhs(..), Role(..),
 
         -- ** Constructing TyCons
         mkAlgTyCon,
@@ -34,18 +34,20 @@ module TyCon(
         isFunTyCon,
         isPrimTyCon,
         isTupleTyCon, isUnboxedTupleTyCon, isBoxedTupleTyCon,
-        isSynTyCon, isOpenSynFamilyTyCon,
+        isSynTyCon, isTypeSynonymTyCon,
         isDecomposableTyCon,
         isForeignTyCon, 
         isPromotedDataCon, isPromotedTyCon,
         isPromotedDataCon_maybe, isPromotedTyCon_maybe,
         promotableTyCon_maybe, promoteTyCon,
 
-        isInjectiveTyCon,
         isDataTyCon, isProductTyCon, isDataProductTyCon_maybe,
         isEnumerationTyCon,
         isNewTyCon, isAbstractTyCon,
-        isFamilyTyCon, isSynFamilyTyCon, isDataFamilyTyCon,
+        isFamilyTyCon, isOpenFamilyTyCon,
+        isSynFamilyTyCon, isDataFamilyTyCon,
+        isOpenSynFamilyTyCon, isClosedSynFamilyTyCon_maybe,
+        isBuiltInSynFamTyCon_maybe,
         isUnLiftedTyCon,
         isGadtSyntaxTyCon, isDistinctTyCon, isDistinctAlgRhs,
         isTyConAssoc, tyConAssoc_maybe,
@@ -63,13 +65,14 @@ module TyCon(
         tyConFamilySize,
         tyConStupidTheta,
         tyConArity,
+        tyConRoles,
         tyConParent,
         tyConTuple_maybe, tyConClass_maybe,
         tyConFamInst_maybe, tyConFamInstSig_maybe, tyConFamilyCoercion_maybe,
         synTyConDefn_maybe, synTyConRhs_maybe, 
         tyConExtName,           -- External name for foreign types
         algTyConRhs,
-        newTyConRhs, newTyConEtadRhs, unwrapNewTyCon_maybe,
+        newTyConRhs, newTyConEtadArity, newTyConEtadRhs, unwrapNewTyCon_maybe,
         tupleTyConBoxity, tupleTyConSort, tupleTyConArity,
 
         -- ** Manipulating TyCons
@@ -80,11 +83,12 @@ module TyCon(
 
         -- * Primitive representations of Types
         PrimRep(..), PrimElemRep(..),
-        tyConPrimRep,
+        tyConPrimRep, isVoidRep, isGcPtrRep,
         primRepSizeW, primElemRepSizeB,
 
         -- * Recursion breaking
         RecTcChecker, initRecTc, checkRecTc
+
 ) where
 
 #include "HsVersions.h"
@@ -137,17 +141,19 @@ Note [Type synonym families]
 * Translation of type family decl:
         type family F a :: *
   translates to
-    a SynTyCon 'F', whose SynTyConRhs is SynFamilyTyCon
+    a SynTyCon 'F', whose SynTyConRhs is OpenSynFamilyTyCon
 
-* Translation of type family decl:
-        type family F a :: *
+        type family G a :: * where
+          G Int = Bool
+          G Bool = Char
+          G a = ()
   translates to
-    a SynTyCon 'F', whose SynTyConRhs is SynFamilyTyCon
+    a SynTyCon 'G', whose SynTyConRhs is ClosedSynFamilyTyCon, with the
+    appropriate CoAxiom representing the equations
 
 * In the future we might want to support
-    * closed type families (esp when we have proper kinds)
     * injective type families (allow decomposition)
-  but we don't at the moment [2010]
+  but we don't at the moment [2013]
 
 Note [Data type families]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -267,6 +273,29 @@ This is important. In an instance declaration we expect
      data T p [x] = T1 x | T2 p
      type F [x] q (Tree y) = (x,y,q)
 
+Note [TyCon Role signatures]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every tycon has a role signature, assigning a role to each of the tyConTyVars
+(or of equal length to the tyConArity, if there are no tyConTyVars). An
+example demonstrates these best: say we have a tycon T, with parameters a at
+nominal, b at representational, and c at phantom. Then, to prove
+representational equality between T a1 b1 c1 and T a2 b2 c2, we need to have
+nominal equality between a1 and a2, representational equality between b1 and
+b2, and nothing in particular (i.e., phantom equality) between c1 and c2. This
+might happen, say, with the following declaration:
+
+  data T a b c where
+    MkT :: b -> T Int b c
+
+Data and class tycons have their roles inferred (see inferRoles in TcTyDecls),
+as do vanilla synonym tycons. Family tycons have all parameters at role N,
+though it is conceivable that we could relax this restriction. (->)'s and
+tuples' parameters are at role R. Each primitive tycon declares its roles;
+it's worth noting that (~#)'s parameters are at role N. Promoted data
+constructors' type arguments are at role R. All kind arguments are at role
+N.
+
 %************************************************************************
 %*                                                                      *
 \subsection{The data type}
@@ -317,6 +346,10 @@ data TyCon
                                   -- 3. The family instance types if present
                                   --
                                   -- Note that it does /not/ scope over the data constructors.
+        tc_roles     :: [Role],   -- ^ The role for each type variable
+                                  -- This list has the same length as tyConTyVars
+                                  -- See also Note [TyCon Role signatures]
+        
         tyConCType   :: Maybe CType, -- The C type that should be used
                                      -- for this type when using the FFI
                                      -- and CAPI
@@ -368,8 +401,9 @@ data TyCon
         tyConArity   :: Arity,
 
         tyConTyVars  :: [TyVar],        -- Bound tyvars
+        tc_roles     :: [Role],
 
-        synTcRhs     :: SynTyConRhs Type,  -- ^ Contains information about the
+        synTcRhs     :: SynTyConRhs,       -- ^ Contains information about the
                                            -- expansion of the synonym
 
         synTcParent  :: TyConParent     -- ^ Gives the family declaration 'TyCon'
@@ -384,8 +418,8 @@ data TyCon
         tyConUnique   :: Unique,
         tyConName     :: Name,
         tc_kind       :: Kind,
-        tyConArity    :: Arity,         -- SLPJ Oct06: I'm not sure what the significance
-                                        --             of the arity of a primtycon is!
+        tyConArity    :: Arity,         
+        tc_roles      :: [Role],
 
         primTyConRep  :: PrimRep,       -- ^ Many primitive tycons are unboxed, but some are
                                         --   boxed (represented by pointers). This 'PrimRep'
@@ -405,6 +439,7 @@ data TyCon
         tyConUnique :: Unique, -- ^ Same Unique as the data constructor
         tyConName   :: Name,   -- ^ Same Name as the data constructor
         tyConArity  :: Arity,
+        tc_roles    :: [Role], -- ^ Roles: N for kind vars, R for type vars
         tc_kind     :: Kind,   -- ^ Translated type of the data constructor
         dataCon     :: DataCon -- ^ Corresponding data constructor
     }
@@ -492,6 +527,7 @@ data AlgTyConRhs
                              -- Watch out!  If any newtypes become transparent
                              -- again check Trac #1072.
     }
+
 \end{code}
 
 Note [AbstractTyCon and type equality]
@@ -577,18 +613,25 @@ isNoParent _             = False
 --------------------
 
 -- | Information pertaining to the expansion of a type synonym (@type@)
-data SynTyConRhs ty
+data SynTyConRhs
   = -- | An ordinary type synonyn.
     SynonymTyCon
-       ty             -- This 'Type' is the rhs, and may mention from 'tyConTyVars'.
+       Type           -- This 'Type' is the rhs, and may mention from 'tyConTyVars'.
                       -- It acts as a template for the expansion when the 'TyCon'
                       -- is applied to some types.
 
-   -- | A type synonym family  e.g. @type family F x y :: * -> *@
-   | SynFamilyTyCon {
-        synf_open :: Bool,         -- See Note [Closed type families]
-        synf_injective :: Bool 
-     }
+   -- | An open type synonym family  e.g. @type family F x y :: * -> *@
+   | OpenSynFamilyTyCon 
+
+   -- | A closed type synonym family  e.g. @type family F x where { F Int = Bool }@
+   | ClosedSynFamilyTyCon
+       (CoAxiom Branched) -- The one axiom for this family
+
+   -- | A closed type synonym family declared in an hs-boot file with
+   -- type family F a where ..
+   | AbstractClosedSynFamilyTyCon
+
+   | BuiltInSynFamTyCon BuiltInSynFamily
 \end{code}
 
 Note [Closed type families]
@@ -596,8 +639,9 @@ Note [Closed type families]
 * In an open type family you can add new instances later.  This is the 
   usual case.  
 
-* In a closed type family you can only put instnaces where the family
-  is defined.  GHC doesn't support syntax for this yet.
+* In a closed type family you can only put equations where the family
+  is defined.
+
 
 Note [Promoted data constructors]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -677,10 +721,12 @@ which encodes as (TyConApp instCoercionTyCon [TyConApp CoT [], s])
 Note [Newtype eta]
 ~~~~~~~~~~~~~~~~~~
 Consider
-        newtype Parser m a = MkParser (Foogle m a)
+        newtype Parser a = MkParser (IO a) derriving( Monad )
 Are these two types equal (to Core)?
-        Monad (Parser m)
-        Monad (Foogle m)
+        Monad Parser
+        Monad IO
+which we need to make the derived instance for Monad Parser.
+
 Well, yes.  But to see that easily we eta-reduce the RHS type of
 Parser, in this case to ([], Froogle), so that even unsaturated applications
 of Parser will work right.  This eta reduction is done when the type
@@ -810,6 +856,14 @@ instance Outputable PrimRep where
 instance Outputable PrimElemRep where
   ppr r = text (show r)
 
+isVoidRep :: PrimRep -> Bool
+isVoidRep VoidRep = True
+isVoidRep _other  = False
+
+isGcPtrRep :: PrimRep -> Bool
+isGcPtrRep PtrRep = True
+isGcPtrRep _      = False
+
 -- | Find the size of a 'PrimRep', in words
 primRepSizeW :: DynFlags -> PrimRep -> Int
 primRepSizeW _      IntRep           = 1
@@ -869,6 +923,7 @@ mkAlgTyCon :: Name
            -> Kind              -- ^ Kind of the resulting 'TyCon'
            -> [TyVar]           -- ^ 'TyVar's scoped over: see 'tyConTyVars'.
                                 --   Arity is inferred from the length of this list
+           -> [Role]            -- ^ The roles for each TyVar
            -> Maybe CType       -- ^ The C type this type corresponds to
                                 --   when using the CAPI FFI
            -> [PredType]        -- ^ Stupid theta: see 'algTcStupidTheta'
@@ -878,13 +933,14 @@ mkAlgTyCon :: Name
            -> Bool              -- ^ Was the 'TyCon' declared with GADT syntax?
            -> Maybe TyCon       -- ^ Promoted version
            -> TyCon
-mkAlgTyCon name kind tyvars cType stupid rhs parent is_rec gadt_syn prom_tc
+mkAlgTyCon name kind tyvars roles cType stupid rhs parent is_rec gadt_syn prom_tc
   = AlgTyCon {
         tyConName        = name,
         tyConUnique      = nameUnique name,
         tc_kind          = kind,
         tyConArity       = length tyvars,
         tyConTyVars      = tyvars,
+        tc_roles         = roles,
         tyConCType       = cType,
         algTcStupidTheta = stupid,
         algTcRhs         = rhs,
@@ -895,9 +951,9 @@ mkAlgTyCon name kind tyvars cType stupid rhs parent is_rec gadt_syn prom_tc
     }
 
 -- | Simpler specialization of 'mkAlgTyCon' for classes
-mkClassTyCon :: Name -> Kind -> [TyVar] -> AlgTyConRhs -> Class -> RecFlag -> TyCon
-mkClassTyCon name kind tyvars rhs clas is_rec
-  = mkAlgTyCon name kind tyvars Nothing [] rhs (ClassTyCon clas) 
+mkClassTyCon :: Name -> Kind -> [TyVar] -> [Role] -> AlgTyConRhs -> Class -> RecFlag -> TyCon
+mkClassTyCon name kind tyvars roles rhs clas is_rec
+  = mkAlgTyCon name kind tyvars roles Nothing [] rhs (ClassTyCon clas) 
                is_rec False 
                Nothing    -- Class TyCons are not pormoted
 
@@ -928,14 +984,14 @@ mkTupleTyCon name kind arity tyvars con sort prom_tc
 mkForeignTyCon :: Name
                -> Maybe FastString -- ^ Name of the foreign imported thing, maybe
                -> Kind
-               -> Arity
                -> TyCon
-mkForeignTyCon name ext_name kind arity
+mkForeignTyCon name ext_name kind
   = PrimTyCon {
         tyConName    = name,
         tyConUnique  = nameUnique name,
         tc_kind    = kind,
-        tyConArity   = arity,
+        tyConArity   = 0,
+        tc_roles     = [],
         primTyConRep = PtrRep, -- they all do
         isUnLifted   = False,
         tyConExtName = ext_name
@@ -943,41 +999,43 @@ mkForeignTyCon name ext_name kind arity
 
 
 -- | Create an unlifted primitive 'TyCon', such as @Int#@
-mkPrimTyCon :: Name  -> Kind -> Arity -> PrimRep -> TyCon
-mkPrimTyCon name kind arity rep
-  = mkPrimTyCon' name kind arity rep True
+mkPrimTyCon :: Name  -> Kind -> [Role] -> PrimRep -> TyCon
+mkPrimTyCon name kind roles rep
+  = mkPrimTyCon' name kind roles rep True
 
 -- | Kind constructors
 mkKindTyCon :: Name -> Kind -> TyCon
 mkKindTyCon name kind
-  = mkPrimTyCon' name kind 0 VoidRep True
+  = mkPrimTyCon' name kind [] VoidRep True
 
 -- | Create a lifted primitive 'TyCon' such as @RealWorld@
-mkLiftedPrimTyCon :: Name  -> Kind -> Arity -> PrimRep -> TyCon
-mkLiftedPrimTyCon name kind arity rep
-  = mkPrimTyCon' name kind arity rep False
+mkLiftedPrimTyCon :: Name  -> Kind -> [Role] -> PrimRep -> TyCon
+mkLiftedPrimTyCon name kind roles rep
+  = mkPrimTyCon' name kind roles rep False
 
-mkPrimTyCon' :: Name  -> Kind -> Arity -> PrimRep -> Bool -> TyCon
-mkPrimTyCon' name kind arity rep is_unlifted
+mkPrimTyCon' :: Name  -> Kind -> [Role] -> PrimRep -> Bool -> TyCon
+mkPrimTyCon' name kind roles rep is_unlifted
   = PrimTyCon {
         tyConName    = name,
         tyConUnique  = nameUnique name,
         tc_kind    = kind,
-        tyConArity   = arity,
+        tyConArity   = length roles,
+        tc_roles     = roles,
         primTyConRep = rep,
         isUnLifted   = is_unlifted,
         tyConExtName = Nothing
     }
 
 -- | Create a type synonym 'TyCon'
-mkSynTyCon :: Name -> Kind -> [TyVar] -> SynTyConRhs Type -> TyConParent -> TyCon
-mkSynTyCon name kind tyvars rhs parent
+mkSynTyCon :: Name -> Kind -> [TyVar] -> [Role] -> SynTyConRhs -> TyConParent -> TyCon
+mkSynTyCon name kind tyvars roles rhs parent
   = SynTyCon {
         tyConName = name,
         tyConUnique = nameUnique name,
         tc_kind = kind,
         tyConArity = length tyvars,
         tyConTyVars = tyvars,
+        tc_roles = roles,
         synTcRhs = rhs,
         synTcParent = parent
     }
@@ -986,15 +1044,18 @@ mkSynTyCon name kind tyvars rhs parent
 -- Somewhat dodgily, we give it the same Name
 -- as the data constructor itself; when we pretty-print
 -- the TyCon we add a quote; see the Outputable TyCon instance
-mkPromotedDataCon :: DataCon -> Name -> Unique -> Kind -> Arity -> TyCon
-mkPromotedDataCon con name unique kind arity
+mkPromotedDataCon :: DataCon -> Name -> Unique -> Kind -> [Role] -> TyCon
+mkPromotedDataCon con name unique kind roles
   = PromotedDataCon {
         tyConName   = name,
         tyConUnique = unique,
         tyConArity  = arity,
+        tc_roles    = roles,
         tc_kind     = kind,
         dataCon     = con
   }
+  where
+    arity = length roles
 
 -- | Create a promoted type constructor 'TyCon'
 -- Somewhat dodgily, we give it the same Name
@@ -1125,10 +1186,16 @@ isDataProductTyCon_maybe (TupleTyCon { dataCon = con })
   = Just con
 isDataProductTyCon_maybe _ = Nothing
 
--- | Is this a 'TyCon' representing a type synonym (@type@)?
+-- | Is this a 'TyCon' representing a regular H98 type synonym (@type@)?
+isTypeSynonymTyCon :: TyCon -> Bool
+isTypeSynonymTyCon (SynTyCon { synTcRhs = SynonymTyCon {} }) = True
+isTypeSynonymTyCon _ = False
+
+-- | Is this 'TyCon' a type synonym or type family?
 isSynTyCon :: TyCon -> Bool
 isSynTyCon (SynTyCon {}) = True
 isSynTyCon _             = False
+
 
 -- As for newtypes, it is in some contexts important to distinguish between
 -- closed synonyms and synonym families, as synonym families have no unique
@@ -1137,7 +1204,14 @@ isSynTyCon _             = False
 
 isDecomposableTyCon :: TyCon -> Bool
 -- True iff we can decompose (T a b c) into ((T a b) c)
+--   I.e. is it injective?
 -- Specifically NOT true of synonyms (open and otherwise)
+-- Ultimately we may have injective associated types
+-- in which case this test will become more interesting
+--
+-- It'd be unusual to call isInjectiveTyCon on a regular H98
+-- type synonym, because you should probably have expanded it first
+-- But regardless, it's not decomposable
 isDecomposableTyCon (SynTyCon {}) = False
 isDecomposableTyCon _other        = True
 
@@ -1153,36 +1227,49 @@ isEnumerationTyCon (AlgTyCon {algTcRhs = DataTyCon { is_enum = res }}) = res
 isEnumerationTyCon (TupleTyCon {tyConArity = arity}) = arity == 0
 isEnumerationTyCon _                                                   = False
 
--- | Is this a 'TyCon', synonym or otherwise, that may have further instances appear?
+-- | Is this a 'TyCon', synonym or otherwise, that defines a family?
 isFamilyTyCon :: TyCon -> Bool
-isFamilyTyCon (SynTyCon {synTcRhs = SynFamilyTyCon {}})  = True
-isFamilyTyCon (AlgTyCon {algTcRhs = DataFamilyTyCon {}}) = True
+isFamilyTyCon (SynTyCon {synTcRhs = OpenSynFamilyTyCon })              = True
+isFamilyTyCon (SynTyCon {synTcRhs = ClosedSynFamilyTyCon {} })         = True
+isFamilyTyCon (SynTyCon {synTcRhs = AbstractClosedSynFamilyTyCon {} }) = True
+isFamilyTyCon (SynTyCon {synTcRhs = BuiltInSynFamTyCon {} })           = True
+isFamilyTyCon (AlgTyCon {algTcRhs = DataFamilyTyCon {}})               = True
 isFamilyTyCon _ = False
+
+-- | Is this a 'TyCon', synonym or otherwise, that defines an family with
+-- instances?
+isOpenFamilyTyCon :: TyCon -> Bool
+isOpenFamilyTyCon (SynTyCon {synTcRhs = OpenSynFamilyTyCon }) = True
+isOpenFamilyTyCon (AlgTyCon {algTcRhs = DataFamilyTyCon })    = True
+isOpenFamilyTyCon _ = False
 
 -- | Is this a synonym 'TyCon' that can have may have further instances appear?
 isSynFamilyTyCon :: TyCon -> Bool
-isSynFamilyTyCon (SynTyCon {synTcRhs = SynFamilyTyCon {}}) = True
+isSynFamilyTyCon (SynTyCon {synTcRhs = OpenSynFamilyTyCon {}})           = True
+isSynFamilyTyCon (SynTyCon {synTcRhs = ClosedSynFamilyTyCon {}})         = True
+isSynFamilyTyCon (SynTyCon {synTcRhs = AbstractClosedSynFamilyTyCon {}}) = True
+isSynFamilyTyCon (SynTyCon {synTcRhs = BuiltInSynFamTyCon {}})           = True
 isSynFamilyTyCon _ = False
 
 isOpenSynFamilyTyCon :: TyCon -> Bool
-isOpenSynFamilyTyCon (SynTyCon {synTcRhs = SynFamilyTyCon { synf_open = is_open } }) = is_open
+isOpenSynFamilyTyCon (SynTyCon {synTcRhs = OpenSynFamilyTyCon }) = True
 isOpenSynFamilyTyCon _ = False
+
+-- leave out abstract closed families here
+isClosedSynFamilyTyCon_maybe :: TyCon -> Maybe (CoAxiom Branched)
+isClosedSynFamilyTyCon_maybe
+  (SynTyCon {synTcRhs = ClosedSynFamilyTyCon ax}) = Just ax
+isClosedSynFamilyTyCon_maybe _ = Nothing
+
+isBuiltInSynFamTyCon_maybe :: TyCon -> Maybe BuiltInSynFamily
+isBuiltInSynFamTyCon_maybe
+  SynTyCon {synTcRhs = BuiltInSynFamTyCon ops } = Just ops
+isBuiltInSynFamTyCon_maybe _ = Nothing
 
 -- | Is this a synonym 'TyCon' that can have may have further instances appear?
 isDataFamilyTyCon :: TyCon -> Bool
 isDataFamilyTyCon (AlgTyCon {algTcRhs = DataFamilyTyCon {}}) = True
 isDataFamilyTyCon _ = False
-
--- | Injective 'TyCon's can be decomposed, so that
---     T ty1 ~ T ty2  =>  ty1 ~ ty2
-isInjectiveTyCon :: TyCon -> Bool
-isInjectiveTyCon tc = not (isSynTyCon tc)
-        -- Ultimately we may have injective associated types
-        -- in which case this test will become more interesting
-        --
-        -- It'd be unusual to call isInjectiveTyCon on a regular H98
-        -- type synonym, because you should probably have expanded it first
-        -- But regardless, it's not injective!
 
 -- | Are we able to extract informationa 'TyVar' to class argument list
 -- mappping from a given 'TyCon'?
@@ -1284,13 +1371,15 @@ isPromotedDataCon_maybe _ = Nothing
 -- * Family instances are /not/ implicit as they represent the instance body
 --   (similar to a @dfun@ does that for a class instance).
 isImplicitTyCon :: TyCon -> Bool
-isImplicitTyCon tycon
-  | isTyConAssoc tycon = True
-  | isSynTyCon tycon   = False
-  | isAlgTyCon tycon   = isTupleTyCon tycon
-  | otherwise          = True
-        -- 'otherwise' catches: FunTyCon, PrimTyCon,
-        -- PromotedDataCon, PomotedTypeTyCon
+isImplicitTyCon (FunTyCon {})        = True
+isImplicitTyCon (TupleTyCon {})      = True
+isImplicitTyCon (PrimTyCon {})       = True
+isImplicitTyCon (PromotedDataCon {}) = True
+isImplicitTyCon (PromotedTyCon {})   = True
+isImplicitTyCon (AlgTyCon { algTcParent = AssocFamilyTyCon {} }) = True
+isImplicitTyCon (AlgTyCon {})                                    = False
+isImplicitTyCon (SynTyCon { synTcParent = AssocFamilyTyCon {} }) = True
+isImplicitTyCon (SynTyCon {})                                    = False
 
 tyConCType_maybe :: TyCon -> Maybe CType
 tyConCType_maybe tc@(AlgTyCon {}) = tyConCType tc
@@ -1376,6 +1465,23 @@ algTyConRhs (AlgTyCon {algTcRhs = rhs}) = rhs
 algTyConRhs (TupleTyCon {dataCon = con, tyConArity = arity})
     = DataTyCon { data_cons = [con], is_enum = arity == 0 }
 algTyConRhs other = pprPanic "algTyConRhs" (ppr other)
+
+-- | Get the list of roles for the type parameters of a TyCon
+tyConRoles :: TyCon -> [Role]
+-- See also Note [TyCon Role signatures]
+tyConRoles tc
+  = case tc of
+    { FunTyCon {}                          -> const_role Representational
+    ; AlgTyCon { tc_roles = roles }        -> roles
+    ; TupleTyCon {}                        -> const_role Representational
+    ; SynTyCon { tc_roles = roles }        -> roles
+    ; PrimTyCon { tc_roles = roles }       -> roles
+    ; PromotedDataCon { tc_roles = roles } -> roles
+    ; PromotedTyCon {}                     -> const_role Nominal
+    }
+  where
+    const_role r = replicate (tyConArity tc) r
+
 \end{code}
 
 \begin{code}
@@ -1384,6 +1490,12 @@ algTyConRhs other = pprPanic "algTyConRhs" (ppr other)
 newTyConRhs :: TyCon -> ([TyVar], Type)
 newTyConRhs (AlgTyCon {tyConTyVars = tvs, algTcRhs = NewTyCon { nt_rhs = rhs }}) = (tvs, rhs)
 newTyConRhs tycon = pprPanic "newTyConRhs" (ppr tycon)
+
+-- | The number of type parameters that need to be passed to a newtype to resolve it. May be less than in the definition if it can be eta-contracted.
+newTyConEtadArity :: TyCon -> Int
+newTyConEtadArity (AlgTyCon {algTcRhs = NewTyCon { nt_etad_rhs = tvs_rhs }})
+        = length (fst tvs_rhs)
+newTyConEtadArity tycon = pprPanic "newTyConEtadArity" (ppr tycon)
 
 -- | Extract the bound type variables and type expansion of an eta-contracted type synonym 'TyCon'.
 -- Panics if the 'TyCon' is not a synonym
@@ -1427,7 +1539,7 @@ synTyConDefn_maybe (SynTyCon {tyConTyVars = tyvars, synTcRhs = SynonymTyCon ty})
 synTyConDefn_maybe _ = Nothing
 
 -- | Extract the information pertaining to the right hand side of a type synonym (@type@) declaration.
-synTyConRhs_maybe :: TyCon -> Maybe (SynTyConRhs Type)
+synTyConRhs_maybe :: TyCon -> Maybe SynTyConRhs
 synTyConRhs_maybe (SynTyCon {synTcRhs = rhs}) = Just rhs
 synTyConRhs_maybe _                           = Nothing
 \end{code}

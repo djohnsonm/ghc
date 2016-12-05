@@ -448,7 +448,7 @@ startSignalHandlers(Capability *cap)
 		       RtsFlags.GcFlags.initialStkSize, 
                        rts_apply(cap,
                                  rts_apply(cap,
-                                           &base_GHCziConcziSignal_runHandlers_closure,
+                                           &base_GHCziConcziSignal_runHandlersPtr_closure,
                                            rts_mkPtr(cap, info)),
                                  rts_mkInt(cap, info->si_signo))));
   }
@@ -574,7 +574,9 @@ set_sigtstp_action (rtsBool handle)
     }
     sa.sa_flags = 0;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGTSTP, &sa, NULL);
+    if (sigaction(SIGTSTP, &sa, NULL) != 0) {
+        sysErrorBelch("warning: failed to install SIGTSTP handler");
+    }
 }
 
 /* -----------------------------------------------------------------------------

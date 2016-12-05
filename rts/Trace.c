@@ -179,6 +179,7 @@ static char *thread_stop_reasons[] = {
     [ThreadFinished] = "finished",
     [THREAD_SUSPENDED_FOREIGN_CALL] = "suspended while making a foreign call",
     [6 + BlockedOnMVar]         = "blocked on an MVar",
+    [6 + BlockedOnMVarRead]     = "blocked on an atomic MVar read",
     [6 + BlockedOnBlackHole]    = "blocked on a black hole",
     [6 + BlockedOnRead]         = "blocked on a read operation",
     [6 + BlockedOnWrite]        = "blocked on a write operation",
@@ -459,7 +460,7 @@ void traceOSProcessInfo_(void) {
                         CAPSET_OSPROCESS_DEFAULT,
                         getpid());
 
-#if !defined(cygwin32_HOST_OS) && !defined (mingw32_HOST_OS)
+#if !defined(cygwin32_HOST_OS) && !defined (mingw32_HOST_OS) && !defined (HaLVM_TARGET_OS)
 /* Windows has no strong concept of process heirarchy, so no getppid().
  * In any case, this trace event is mainly useful for tracing programs
  * that use 'forkProcess' which Windows doesn't support anyway.

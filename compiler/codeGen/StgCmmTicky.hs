@@ -9,7 +9,7 @@
 {- OVERVIEW: ticky ticky profiling
 
 Please see
-http://hackage.haskell.org/trac/ghc/wiki/Debugging/TickyTicky and also
+http://ghc.haskell.org/trac/ghc/wiki/Debugging/TickyTicky and also
 edit it and the rest of this comment to keep them up-to-date if you
 change ticky-ticky. Thanks!
 
@@ -240,9 +240,9 @@ tickyEnterViaNode     = ifTicky $ bumpTickyCounter (fsLit "ENT_VIA_NODE_ctr")
 
 tickyEnterThunk :: ClosureInfo -> FCode ()
 tickyEnterThunk cl_info
-  = ifTicky $ do 
+  = ifTicky $ do
     { bumpTickyCounter ctr
-    ; unless static $ do 
+    ; unless static $ do
       ticky_ctr_lbl <- getTickyCtrLabel
       registerTickyCtrAtEntryDyn ticky_ctr_lbl
       bumpTickyEntryCount ticky_ctr_lbl }
@@ -570,19 +570,18 @@ bumpTickyLit lhs = bumpTickyLitBy lhs 1
 bumpTickyLitBy :: CmmLit -> Int -> FCode ()
 bumpTickyLitBy lhs n = do
   dflags <- getDynFlags
-  -- All the ticky-ticky counters are declared "unsigned long" in C
-  emit (addToMem (cLong dflags) (CmmLit lhs) n)
+  emit (addToMem (bWord dflags) (CmmLit lhs) n)
 
 bumpTickyLitByE :: CmmLit -> CmmExpr -> FCode ()
 bumpTickyLitByE lhs e = do
   dflags <- getDynFlags
-  -- All the ticky-ticky counters are declared "unsigned long" in C
-  emit (addToMemE (cLong dflags) (CmmLit lhs) e)
+  emit (addToMemE (bWord dflags) (CmmLit lhs) e)
 
 bumpHistogram :: FastString -> Int -> FCode ()
 bumpHistogram _lbl _n
 --  = bumpHistogramE lbl (CmmLit (CmmInt (fromIntegral n) cLongWidth))
     = return ()    -- TEMP SPJ Apr 07
+                   -- six years passed - still temp? JS Aug 2013
 
 {-
 bumpHistogramE :: LitString -> CmmExpr -> FCode ()

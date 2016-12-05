@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Modifying
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -85,6 +85,11 @@ ifeq "$(CC_LLVM_BACKEND)" "1"
 	@echo "#define llvm_CC_FLAVOR 1" >> $@
 endif
 #
+ifeq "$(CC_CLANG_BACKEND)" "1"
+	@echo >> $@
+	@echo "#define clang_CC_FLAVOR 1" >> $@
+endif
+#
 	@echo "#endif /* __GHCAUTOCONF_H__ */"          >> $@
 	@echo "Done."
 
@@ -153,6 +158,9 @@ INSTALL_LIBS += $(includes_GHCCONSTANTS_HASKELL_VALUE)
 DERIVE_CONSTANTS_FLAGS += --gcc-program "$(WhatGccIsCalled)"
 DERIVE_CONSTANTS_FLAGS += $(addprefix --gcc-flag$(space),$(includes_CC_OPTS) -fcommon)
 DERIVE_CONSTANTS_FLAGS += --nm-program "$(NM)"
+ifeq "$(TargetOS_CPP)" "HaLVM"
+DERIVE_CONSTANTS_FLAGS += --gcc-flag -Irts/xen/include
+endif
 
 ifneq "$(BINDIST)" "YES"
 $(includes_DERIVEDCONSTANTS):           $$(includes_H_CONFIG) $$(includes_H_PLATFORM) $$(includes_H_FILES) $$(rts_H_FILES)

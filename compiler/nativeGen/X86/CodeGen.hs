@@ -610,6 +610,8 @@ getRegister' dflags is32Bit (CmmMachOp mop [x]) = do -- unary MachOps
       MO_VS_Quot {}    -> needLlvm
       MO_VS_Rem {}     -> needLlvm
       MO_VS_Neg {}     -> needLlvm
+      MO_VU_Quot {}    -> needLlvm
+      MO_VU_Rem {}     -> needLlvm
       MO_VF_Insert {}  -> needLlvm
       MO_VF_Extract {} -> needLlvm
       MO_VF_Add {}     -> needLlvm
@@ -1656,7 +1658,49 @@ genCCall _ (PrimTarget MO_WriteBarrier) _ _ = return nilOL
 
 genCCall _ (PrimTarget MO_Touch) _ _ = return nilOL
 
-genCCall _ (PrimTarget MO_Prefetch_Data) _ _ = return nilOL
+genCCall is32bit (PrimTarget (MO_Prefetch_Data n )) _  [src] =
+        case n of
+            0 -> genPrefetch src $ PREFETCH NTA  size
+            1 -> genPrefetch src $ PREFETCH Lvl2 size
+            2 -> genPrefetch src $ PREFETCH Lvl1 size
+            3 -> genPrefetch src $ PREFETCH Lvl0 size
+            l -> panic $ "unexpected prefetch level in genCCall MO_Prefetch_Data: " ++ (show l)
+            -- the c / llvm prefetch convention is 0, 1, 2, and 3
+            -- the x86 corresponding names are : NTA, 2 , 1, and 0
+   where
+        size = archWordSize is32bit
+        -- need to know what register width for pointers!
+        genPrefetch inRegSrc prefetchCTor =
+            do
+                code_src <- getAnyReg inRegSrc
+                src_r <- getNewRegNat size
+                return $ code_src src_r `appOL`
+                  (unitOL (prefetchCTor  (OpAddr
+                              ((AddrBaseIndex (EABaseReg src_r )   EAIndexNone (ImmInt 0))))  ))
+                  -- prefetch always takes an address
+
+genCCall is32Bit (PrimTarget (MO_BSwap width)) [dst] [src] = do
+    dflags <- getDynFlags
+    let platform = targetPlatform dflags
+    let dst_r = getRegisterReg platform False (CmmLocal dst)
+    case width of
+        W64 | is32Bit -> do
+               ChildCode64 vcode rlo <- iselExpr64 src
+               let dst_rhi = getHiVRegFromLo dst_r
+                   rhi     = getHiVRegFromLo rlo
+               return $ vcode `appOL`
+                        toOL [ MOV II32 (OpReg rlo) (OpReg dst_rhi),
+                               MOV II32 (OpReg rhi) (OpReg dst_r),
+                               BSWAP II32 dst_rhi,
+                               BSWAP II32 dst_r ]
+        W16 -> do code_src <- getAnyReg src
+                  return $ code_src dst_r `appOL`
+                           unitOL (BSWAP II32 dst_r) `appOL`
+                           unitOL (SHR II32 (OpImm $ ImmInt 16) (OpReg dst_r))
+        _   -> do code_src <- getAnyReg src
+                  return $ code_src dst_r `appOL` unitOL (BSWAP size dst_r)
+  where
+    size = intSize width
 
 genCCall is32Bit (PrimTarget (MO_PopCnt width)) dest_regs@[dst]
          args@[src] = do
@@ -1666,15 +1710,19 @@ genCCall is32Bit (PrimTarget (MO_PopCnt width)) dest_regs@[dst]
     if sse4_2
         then do code_src <- getAnyReg src
                 src_r <- getNewRegNat size
+                let dst_r = getRegisterReg platform False (CmmLocal dst)
                 return $ code_src src_r `appOL`
                     (if width == W8 then
                          -- The POPCNT instruction doesn't take a r/m8
                          unitOL (MOVZxL II8 (OpReg src_r) (OpReg src_r)) `appOL`
-                         unitOL (POPCNT II16 (OpReg src_r)
-                                 (getRegisterReg platform False (CmmLocal dst)))
+                         unitOL (POPCNT II16 (OpReg src_r) dst_r)
                      else
-                         unitOL (POPCNT size (OpReg src_r)
-                                 (getRegisterReg platform False (CmmLocal dst))))
+                         unitOL (POPCNT size (OpReg src_r) dst_r)) `appOL`
+                    (if width == W8 || width == W16 then
+                         -- We used a 16-bit destination register above,
+                         -- so zero-extend
+                         unitOL (MOVZxL II16 (OpReg dst_r) (OpReg dst_r))
+                     else nilOL)
         else do
             targetExpr <- cmmMakeDynamicReference dflags
                           CallReference lbl
@@ -1834,7 +1882,7 @@ genCCall32' dflags target dest_regs args = do
         use_sse2 <- sse2Enabled
         push_codes <- mapM (push_arg use_sse2) (reverse prom_args)
         delta <- getDeltaNat
-        MASSERT (delta == delta0 - tot_arg_size)
+        MASSERT(delta == delta0 - tot_arg_size)
 
         -- deal with static vs dynamic call targets
         (callinsns,cconv) <-
@@ -2325,6 +2373,7 @@ outOfLineCmmOp mop res args
               MO_Memmove   -> fsLit "memmove"
 
               MO_PopCnt _  -> fsLit "popcnt"
+              MO_BSwap _   -> fsLit "bswap"
 
               MO_UF_Conv _ -> unsupported
 
@@ -2335,7 +2384,7 @@ outOfLineCmmOp mop res args
               MO_U_Mul2 {}     -> unsupported
               MO_WriteBarrier  -> unsupported
               MO_Touch         -> unsupported
-              MO_Prefetch_Data -> unsupported
+              (MO_Prefetch_Data _ ) -> unsupported
         unsupported = panic ("outOfLineCmmOp: " ++ show mop
                           ++ " not supported here")
 

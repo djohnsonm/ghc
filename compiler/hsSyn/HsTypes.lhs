@@ -32,20 +32,20 @@ module HsTypes (
         splitLHsInstDeclTy_maybe,
         splitHsClassTy_maybe, splitLHsClassTy_maybe,
         splitHsFunType,
-        splitHsAppTys, mkHsAppTys, mkHsOpTy,
+        splitHsAppTys, hsTyGetAppHead_maybe, mkHsAppTys, mkHsOpTy,
 
         -- Printing
-        pprParendHsType, pprHsForAll, pprHsContext, ppr_hs_context,
+        pprParendHsType, pprHsForAll, pprHsContext, pprHsContextNoArrow, ppr_hs_context,
     ) where
 
-import {-# SOURCE #-} HsExpr ( HsSplice, pprSplice )
+import {-# SOURCE #-} HsExpr ( HsSplice, pprUntypedSplice )
 
 import HsLit
 
-import NameSet( FreeVars )
 import Name( Name )
 import RdrName( RdrName )
 import DataCon( HsBang(..) )
+import TysPrim( funTyConName )
 import Type
 import HsDoc
 import BasicTypes
@@ -179,19 +179,14 @@ instance OutputableBndr HsIPName where
     pprInfixOcc  n = ppr n
     pprPrefixOcc n = ppr n
 
-
 data HsTyVarBndr name
-  = UserTyVar           -- No explicit kinding
-         name           -- See Note [Printing KindedTyVars]
+  = UserTyVar        -- no explicit kinding
+         name
 
   | KindedTyVar
          name
-         (LHsKind name)   -- The user-supplied kind signature
-      --  *** NOTA BENE *** A "monotype" in a pragma can have
-      -- for-alls in it, (mostly to do with dictionaries).  These
-      -- must be explicitly Kinded.
+         (LHsKind name)  -- The user-supplied kind signature
   deriving (Data, Typeable)
-
 
 data HsType name
   = HsForAllTy  HsExplicitFlag          -- Renamer leaves this flag unchanged, to record the way
@@ -235,7 +230,6 @@ data HsType name
   | HsQuasiQuoteTy      (HsQuasiQuote name)
 
   | HsSpliceTy          (HsSplice name) 
-                        FreeVars        -- Variables free in the splice (filled in by renamer)
                         PostTcKind
 
   | HsDocTy             (LHsType name) LHsDocString -- A documented type
@@ -414,9 +408,9 @@ plus :: HsExplicitFlag -> HsExplicitFlag -> HsExplicitFlag
 Implicit `plus` Implicit = Implicit
 _        `plus` _        = Explicit
 
-hsExplicitTvs :: LHsType name -> [name]
+hsExplicitTvs :: LHsType Name -> [Name]
 -- The explicitly-given forall'd type variables of a HsType
-hsExplicitTvs (L _ (HsForAllTy Explicit tvs _ _)) = hsLTyVarNames tvs
+hsExplicitTvs (L _ (HsForAllTy Explicit tvs _ _)) = hsLKiTyVarNames tvs
 hsExplicitTvs _                                   = []
 
 ---------------------
@@ -449,6 +443,20 @@ splitHsAppTys :: LHsType n -> [LHsType n] -> (LHsType n, [LHsType n])
 splitHsAppTys (L _ (HsAppTy f a)) as = splitHsAppTys f (a:as)
 splitHsAppTys (L _ (HsParTy f))   as = splitHsAppTys f as
 splitHsAppTys f                   as = (f,as)
+
+-- retrieve the name of the "head" of a nested type application
+-- somewhat like splitHsAppTys, but a little more thorough
+-- used to examine the result of a GADT-like datacon, so it doesn't handle
+-- *all* cases (like lists, tuples, (~), etc.)
+hsTyGetAppHead_maybe :: LHsType n -> Maybe (n, [LHsType n])
+hsTyGetAppHead_maybe = go []
+  where
+    go tys (L _ (HsTyVar n))             = Just (n, tys)
+    go tys (L _ (HsAppTy l r))           = go (r : tys) l
+    go tys (L _ (HsOpTy l (_, L _ n) r)) = Just (n, l : r : tys)
+    go tys (L _ (HsParTy t))             = go tys t
+    go tys (L _ (HsKindSig t _))         = go tys t
+    go _   _                             = Nothing
 
 mkHsAppTys :: OutputableBndr n => LHsType n -> [LHsType n] -> HsType n
 mkHsAppTys fun_ty [] = pprPanic "mkHsAppTys" (ppr fun_ty)
@@ -499,15 +507,31 @@ splitLHsClassTy_maybe ty
         HsKindSig ty _     -> checkl ty args
         _                  -> Nothing
 
--- Splits HsType into the (init, last) parts
+-- splitHsFunType decomposes a type (t1 -> t2 ... -> tn)
 -- Breaks up any parens in the result type: 
 --      splitHsFunType (a -> (b -> c)) = ([a,b], c)
-splitHsFunType :: LHsType name -> ([LHsType name], LHsType name)
-splitHsFunType (L _ (HsFunTy x y)) = (x:args, res)
-  where
-  (args, res) = splitHsFunType y
-splitHsFunType (L _ (HsParTy ty))  = splitHsFunType ty
-splitHsFunType other               = ([], other)
+-- Also deals with (->) t1 t2; that is why it only works on LHsType Name
+--   (see Trac #9096)
+splitHsFunType :: LHsType Name -> ([LHsType Name], LHsType Name)
+splitHsFunType (L _ (HsParTy ty)) 
+  = splitHsFunType ty
+
+splitHsFunType (L _ (HsFunTy x y))
+  | (args, res) <- splitHsFunType y
+  = (x:args, res)
+
+splitHsFunType orig_ty@(L _ (HsAppTy t1 t2)) 
+  = go t1 [t2]
+  where  -- Look for (->) t1 t2, possibly with parenthesisation
+    go (L _ (HsTyVar fn))    tys | fn == funTyConName
+                                 , [t1,t2] <- tys
+                                 , (args, res) <- splitHsFunType t2
+                                 = (t1:args, res)
+    go (L _ (HsAppTy t1 t2)) tys = go t1 (t2:tys)
+    go (L _ (HsParTy ty))    tys = go ty tys
+    go _                     _   = ([], orig_ty)  -- Failure to match
+
+splitHsFunType other = ([], other)
 \end{code}
 
 
@@ -529,8 +553,8 @@ instance (OutputableBndr name) => Outputable (LHsTyVarBndrs name) where
       = sep [ ifPprDebug $ braces (interppSP kvs), interppSP tvs ]
 
 instance (OutputableBndr name) => Outputable (HsTyVarBndr name) where
-    ppr (UserTyVar name)        = ppr name
-    ppr (KindedTyVar name kind) = parens $ hsep [ppr name, dcolon, ppr kind]
+    ppr (UserTyVar n)     = ppr n
+    ppr (KindedTyVar n k) = parens $ hsep [ppr n, dcolon, ppr k]
 
 instance (Outputable thing) => Outputable (HsWithBndrs thing) where
     ppr (HsWB { hswb_cts = ty }) = ppr ty
@@ -546,9 +570,13 @@ pprHsForAll exp qtvs cxt
     forall_part = ptext (sLit "forall") <+> ppr qtvs <> dot
 
 pprHsContext :: (OutputableBndr name) => HsContext name -> SDoc
-pprHsContext []         = empty
-pprHsContext [L _ pred] = ppr pred <+> darrow
-pprHsContext cxt        = ppr_hs_context cxt <+> darrow
+pprHsContext []  = empty
+pprHsContext cxt = pprHsContextNoArrow cxt <+> darrow
+
+pprHsContextNoArrow :: (OutputableBndr name) => HsContext name -> SDoc
+pprHsContextNoArrow []         = empty
+pprHsContextNoArrow [L _ pred] = ppr pred
+pprHsContextNoArrow cxt        = ppr_hs_context cxt
 
 ppr_hs_context :: (OutputableBndr name) => HsContext name -> SDoc
 ppr_hs_context []  = empty
@@ -625,7 +653,7 @@ ppr_mono_ty _    (HsKindSig ty kind) = parens (ppr_mono_lty pREC_TOP ty <+> dcol
 ppr_mono_ty _    (HsListTy ty)       = brackets (ppr_mono_lty pREC_TOP ty)
 ppr_mono_ty _    (HsPArrTy ty)       = paBrackets (ppr_mono_lty pREC_TOP ty)
 ppr_mono_ty prec (HsIParamTy n ty)   = maybeParen prec pREC_FUN (ppr n <+> dcolon <+> ppr_mono_lty pREC_TOP ty)
-ppr_mono_ty _    (HsSpliceTy s _ _)  = pprSplice s
+ppr_mono_ty _    (HsSpliceTy s _)    = pprUntypedSplice s
 ppr_mono_ty _    (HsCoreTy ty)       = ppr ty
 ppr_mono_ty _    (HsExplicitListTy _ tys) = quote $ brackets (interpp'SP tys)
 ppr_mono_ty _    (HsExplicitTupleTy _ tys) = quote $ parens (interpp'SP tys)

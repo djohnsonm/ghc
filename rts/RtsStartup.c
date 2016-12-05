@@ -69,7 +69,8 @@ static void flushStdHandles(void);
 
 const RtsConfig defaultRtsConfig  = {
     .rts_opts_enabled = RtsOptsSafeOnly,
-    .rts_opts = NULL
+    .rts_opts = NULL,
+    .rts_hs_main = rtsFalse
 };
 
 /* -----------------------------------------------------------------------------
@@ -111,6 +112,14 @@ hs_init(int *argc, char **argv[])
 }
 
 void
+hs_init_with_rtsopts(int *argc, char **argv[])
+{
+    RtsConfig rts_opts = defaultRtsConfig; /* by value */
+    rts_opts.rts_opts_enabled = RtsOptsAll;
+    hs_init_ghc(argc, argv, rts_opts);
+}
+
+void
 hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
 {
     hs_init_count++;
@@ -119,7 +128,9 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
 	return;
     }
 
+#ifndef HaLVM_TARGET_OS
     setlocale(LC_CTYPE,"");
+#endif
 
     /* Initialise the stats department, phase 0 */
     initStats0();
@@ -146,11 +157,11 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
         char *my_argv[] = { "<unknown>", NULL };
         setFullProgArgv(my_argc,my_argv);
         setupRtsFlags(&my_argc, my_argv,
-                      rts_config.rts_opts_enabled, rts_config.rts_opts);
+                      rts_config.rts_opts_enabled, rts_config.rts_opts, rts_config.rts_hs_main);
     } else {
         setFullProgArgv(*argc,*argv);
         setupRtsFlags(argc, *argv,
-                      rts_config.rts_opts_enabled, rts_config.rts_opts);
+                      rts_config.rts_opts_enabled, rts_config.rts_opts, rts_config.rts_hs_main);
     }
 
     /* Initialise the stats department, phase 1 */
@@ -204,15 +215,17 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
     getStablePtr((StgPtr)runSparks_closure);
     getStablePtr((StgPtr)ensureIOManagerIsRunning_closure);
     getStablePtr((StgPtr)ioManagerCapabilitiesChanged_closure);
-#ifndef mingw32_HOST_OS
-    getStablePtr((StgPtr)runHandlers_closure);
+#if !defined(mingw32_HOST_OS) && !defined(HaLVM_TARGET_OS)
+    getStablePtr((StgPtr)runHandlersPtr_closure);
 #endif
 
     /* initialise the shared Typeable store */
     initGlobalStore();
 
     /* initialise file locking, if necessary */
+#if !defined(HaLVM_TARGET_OS)
     initFileLocking();
+#endif
 
 #if defined(DEBUG)
     /* initialise thread label table (tso->char*) */
@@ -242,7 +255,9 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
     x86_init_fpu();
 #endif
 
+#ifndef HaLVM_TARGET_OS
     startupHpc();
+#endif
 
     // This must be done after module initialisation.
     // ToDo: make this work in the presence of multiple hs_add_root()s.
@@ -295,6 +310,8 @@ hs_add_root(void (*init_root)(void) STG_UNUSED)
 static void
 hs_exit_(rtsBool wait_foreign)
 {
+    nat g;
+
     if (hs_init_count <= 0) {
 	errorBelch("warning: too many hs_exit()s");
 	return;
@@ -325,7 +342,9 @@ hs_exit_(rtsBool wait_foreign)
     exitScheduler(wait_foreign);
 
     /* run C finalizers for all active weak pointers */
-    runAllCFinalizers(weak_ptr_list);
+    for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
+        runAllCFinalizers(generations[g].weak_ptr_list);
+    }
 
 #if defined(RTS_USER_SIGNALS)
     if (RtsFlags.MiscFlags.install_signal_handlers) {
@@ -338,18 +357,24 @@ hs_exit_(rtsBool wait_foreign)
     exitTimer(wait_foreign);
 
     // set the terminal settings back to what they were
-#if !defined(mingw32_HOST_OS)
+#if !defined(mingw32_HOST_OS) && !defined(HaLVM_TARGET_OS)
     resetTerminalSettings();
 #endif
 
-    // uninstall signal handlers
-    resetDefaultHandlers();
+#if defined(RTS_USER_SIGNALS)
+    if (RtsFlags.MiscFlags.install_signal_handlers) {
+        // uninstall signal handlers
+        resetDefaultHandlers();
+    }
+#endif
 
     /* stop timing the shutdown, we're about to print stats */
     stat_endExit();
-
+   
+#ifndef HaLVM_TARGET_OS 
     /* shutdown the hpc support (if needed) */
     exitHpc();
+#endif
 
     // clean up things from the storage manager's point of view.
     // also outputs the stats (+RTS -s) info.
@@ -365,7 +390,9 @@ hs_exit_(rtsBool wait_foreign)
     exitLinker();
 
     /* free file locking tables, if necessary */
+#if !defined(HaLVM_TARGET_OS)
     freeFileLocking();
+#endif
 
     /* free the stable pointer table */
     exitStableTables();
@@ -442,24 +469,70 @@ shutdownHaskell(void)
 }
 
 void
-shutdownHaskellAndExit(int n)
+shutdownHaskellAndExit(int n, int fastExit)
 {
-    // even if hs_init_count > 1, we still want to shut down the RTS
-    // and exit immediately (see #5402)
-    hs_init_count = 1;
+    if (!fastExit) {
+        // even if hs_init_count > 1, we still want to shut down the RTS
+        // and exit immediately (see #5402)
+        hs_init_count = 1;
 
-    // we're about to exit(), no need to wait for foreign calls to return.
-    hs_exit_(rtsFalse);
+        // we're about to exit(), no need to wait for foreign calls to return.
+        hs_exit_(rtsFalse);
+    }
 
     stg_exit(n);
 }
 
 #ifndef mingw32_HOST_OS
+static void exitBySignal(int sig) GNUC3_ATTRIBUTE(__noreturn__);
+
 void
-shutdownHaskellAndSignal(int sig)
+shutdownHaskellAndSignal(int sig, int fastExit)
 {
-    hs_exit_(rtsFalse);
-    kill(getpid(),sig);
+    if (!fastExit) {
+        hs_exit_(rtsFalse);
+    }
+
+    exitBySignal(sig);
+}
+
+void
+exitBySignal(int sig)
+{
+    // We're trying to kill ourselves with a given signal.
+    // That's easier said that done because:
+    //  - signals can be ignored have handlers set for them
+    //  - signals can be masked
+    //  - signals default action can do things other than terminate:
+    //    + can do nothing
+    //    + can do weirder things: stop/continue the process
+
+    struct sigaction dfl;
+    sigset_t sigset;
+
+    // So first of all, we reset the signal to use the default action.
+    (void)sigemptyset(&dfl.sa_mask);
+    dfl.sa_flags = 0;
+    dfl.sa_handler = SIG_DFL;
+    (void)sigaction(sig, &dfl, NULL);
+
+    // Then we unblock the signal so we can deliver it to ourselves
+    sigemptyset(&sigset);
+    sigaddset(&sigset, sig);
+    sigprocmask(SIG_UNBLOCK, &sigset, NULL);
+
+    switch (sig) {
+      case SIGSTOP: case SIGTSTP: case SIGTTIN: case SIGTTOU: case SIGCONT:
+        // These signals stop (or continue) the process, so are no good for
+        // exiting.
+        exit(0xff);
+
+      default:
+        kill(getpid(),sig);
+        // But it's possible the signal is one where the default action is to
+        // ignore, in which case we'll still be alive... so just exit.
+        exit(0xff);
+    }
 }
 #endif
 

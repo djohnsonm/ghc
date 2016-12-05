@@ -7,7 +7,7 @@
  * Documentation on the architecture of the Garbage Collector can be
  * found in the online commentary:
  * 
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
  *
  * ---------------------------------------------------------------------------*/
 
@@ -53,9 +53,14 @@ scavengeTSO (StgTSO *tso)
 
     debugTrace(DEBUG_gc,"scavenging thread %d",(int)tso->id);
 
-    // update the pointer from the Task.
+    // update the pointer from the InCall.
     if (tso->bound != NULL) {
-        tso->bound->tso = tso;
+        // NB. We can't just set tso->bound->tso = tso, because this
+        // might be an invalid copy the TSO resulting from multiple
+        // threads evacuating the TSO simultaneously (see
+        // Evac.c:copy_tag()).  Calling evacuate() on this pointer
+        // will ensure that we update it to point to the correct copy.
+        evacuate((StgClosure **)&tso->bound->tso);
     }
 
     saved_eager = gct->eager_promotion;
@@ -71,6 +76,7 @@ scavengeTSO (StgTSO *tso)
 
     evacuate((StgClosure **)&tso->_link);
     if (   tso->why_blocked == BlockedOnMVar
+        || tso->why_blocked == BlockedOnMVarRead
 	|| tso->why_blocked == BlockedOnBlackHole
 	|| tso->why_blocked == BlockedOnMsgThrowTo
         || tso->why_blocked == NotBlocked

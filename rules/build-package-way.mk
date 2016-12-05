@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Modifying
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -94,7 +94,7 @@ $$($1_$2_$3_LIB) : $$($1_$2_$3_ALL_OBJS) $$(ALL_RTS_LIBS) $$($1_$2_$3_DEPS_LIBS)
 endif
 else
 # Build the ordinary .a library
-$$($1_$2_$3_LIB) : $$($1_$2_$3_ALL_OBJS)
+$$($1_$2_$3_LIB) : $$($1_$2_$3_ALL_OBJS) $$($1_$2_$3_DEPS_LIBS)
 	$$(call removeFiles,$$@ $$@.contents)
 ifeq "$$($1_$2_SplitObjs)" "YES"
 	$$(FIND) $$(patsubst %.$$($3_osuf),%_$$($3_osuf)_split,$$($1_$2_$3_HS_OBJS)) -name '*.$$($3_osuf)' -print >> $$@.contents

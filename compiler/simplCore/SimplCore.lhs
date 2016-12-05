@@ -36,7 +36,7 @@ import LiberateCase     ( liberateCase )
 import SAT              ( doStaticArgs )
 import Specialise       ( specProgram)
 import SpecConstr       ( specConstrProgram)
-import DmdAnal       ( dmdAnalProgram )
+import DmdAnal          ( dmdAnalProgram )
 import WorkWrap         ( wwTopBinds )
 import Vectorise        ( vectorise )
 import FastString
@@ -53,7 +53,7 @@ import Type             ( mkTyConTy )
 import RdrName          ( mkRdrQual )
 import OccName          ( mkVarOcc )
 import PrelNames        ( pluginTyConName )
-import DynamicLoading   ( forceLoadTyCon, lookupRdrNameInModule, getValueSafely )
+import DynamicLoading   ( forceLoadTyCon, lookupRdrNameInModuleForPlugins, getValueSafely )
 import Module           ( ModuleName )
 import Panic
 #endif
@@ -121,6 +121,7 @@ getCoreToDo dflags
     cse           = gopt Opt_CSE                          dflags
     spec_constr   = gopt Opt_SpecConstr                   dflags
     liberate_case = gopt Opt_LiberateCase                 dflags
+    late_dmd_anal = gopt Opt_LateDmdAnal                  dflags
     static_args   = gopt Opt_StaticArgumentTransformation dflags
     rules_on      = gopt Opt_EnableRewriteRules           dflags
     eta_expand_on = gopt Opt_DoLambdaEtaExpansion         dflags
@@ -294,7 +295,15 @@ getCoreToDo dflags
         maybe_rule_check (Phase 0),
 
         -- Final clean-up simplification:
-        simpl_phase 0 ["final"] max_iter
+        simpl_phase 0 ["final"] max_iter,
+
+        runWhen late_dmd_anal $ CoreDoPasses [
+            CoreDoStrictness,
+            CoreDoWorkerWrapper,
+            simpl_phase 0 ["post-late-ww"] max_iter
+          ],
+
+        maybe_rule_check (Phase 0)
      ]
 \end{code}
 
@@ -326,7 +335,7 @@ loadPlugin :: HscEnv -> ModuleName -> IO Plugin
 loadPlugin hsc_env mod_name
   = do { let plugin_rdr_name = mkRdrQual mod_name (mkVarOcc "plugin")
              dflags = hsc_dflags hsc_env
-       ; mb_name <- lookupRdrNameInModule hsc_env mod_name plugin_rdr_name
+       ; mb_name <- lookupRdrNameInModuleForPlugins hsc_env mod_name plugin_rdr_name
        ; case mb_name of {
             Nothing ->
                 throwGhcExceptionIO (CmdLineError $ showSDoc dflags $ hsep
@@ -361,56 +370,57 @@ runCorePasses passes guts
     do_pass guts CoreDoNothing = return guts
     do_pass guts (CoreDoPasses ps) = runCorePasses ps guts
     do_pass guts pass
-       = do { dflags <- getDynFlags
+       = do { hsc_env <- getHscEnv
+            ; let dflags = hsc_dflags hsc_env
             ; liftIO $ showPass dflags pass
-            ; guts' <- doCorePass dflags pass guts
-            ; liftIO $ endPass dflags pass (mg_binds guts') (mg_rules guts')
+            ; guts' <- doCorePass pass guts
+            ; liftIO $ endPass hsc_env pass (mg_binds guts') (mg_rules guts')
             ; return guts' }
 
-doCorePass :: DynFlags -> CoreToDo -> ModGuts -> CoreM ModGuts
-doCorePass _      pass@(CoreDoSimplify {})  = {-# SCC "Simplify" #-}
-                                              simplifyPgm pass
+doCorePass :: CoreToDo -> ModGuts -> CoreM ModGuts
+doCorePass pass@(CoreDoSimplify {})  = {-# SCC "Simplify" #-}
+                                       simplifyPgm pass
 
-doCorePass _      CoreCSE                   = {-# SCC "CommonSubExpr" #-}
-                                              doPass cseProgram
+doCorePass CoreCSE                   = {-# SCC "CommonSubExpr" #-}
+                                       doPass cseProgram
 
-doCorePass _      CoreLiberateCase          = {-# SCC "LiberateCase" #-}
-                                              doPassD liberateCase
+doCorePass CoreLiberateCase          = {-# SCC "LiberateCase" #-}
+                                       doPassD liberateCase
 
-doCorePass dflags CoreDoFloatInwards        = {-# SCC "FloatInwards" #-}
-                                              doPass (floatInwards dflags)
+doCorePass CoreDoFloatInwards        = {-# SCC "FloatInwards" #-}
+                                       doPassD floatInwards
 
-doCorePass _      (CoreDoFloatOutwards f)   = {-# SCC "FloatOutwards" #-}
-                                              doPassDUM (floatOutwards f)
+doCorePass (CoreDoFloatOutwards f)   = {-# SCC "FloatOutwards" #-}
+                                       doPassDUM (floatOutwards f)
 
-doCorePass _      CoreDoStaticArgs          = {-# SCC "StaticArgs" #-}
-                                              doPassU doStaticArgs
+doCorePass CoreDoStaticArgs          = {-# SCC "StaticArgs" #-}
+                                       doPassU doStaticArgs
 
-doCorePass _      CoreDoStrictness          = {-# SCC "NewStranal" #-}
-                                              doPassDM dmdAnalProgram
+doCorePass CoreDoStrictness          = {-# SCC "NewStranal" #-}
+                                       doPassDFM dmdAnalProgram
 
-doCorePass dflags CoreDoWorkerWrapper       = {-# SCC "WorkWrap" #-}
-                                              doPassU (wwTopBinds dflags)
+doCorePass CoreDoWorkerWrapper       = {-# SCC "WorkWrap" #-}
+                                       doPassDFU wwTopBinds
 
-doCorePass dflags CoreDoSpecialising        = {-# SCC "Specialise" #-}
-                                              specProgram dflags
+doCorePass CoreDoSpecialising        = {-# SCC "Specialise" #-}
+                                       specProgram
 
-doCorePass _      CoreDoSpecConstr          = {-# SCC "SpecConstr" #-}
-                                              specConstrProgram
+doCorePass CoreDoSpecConstr          = {-# SCC "SpecConstr" #-}
+                                       specConstrProgram
 
-doCorePass _      CoreDoVectorisation       = {-# SCC "Vectorise" #-}
-                                              vectorise
+doCorePass CoreDoVectorisation       = {-# SCC "Vectorise" #-}
+                                       vectorise
 
-doCorePass _      CoreDoPrintCore              = observe   printCore
-doCorePass _      (CoreDoRuleCheck phase pat)  = ruleCheckPass phase pat
-doCorePass _      CoreDoNothing                = return
-doCorePass _      (CoreDoPasses passes)        = runCorePasses passes
+doCorePass CoreDoPrintCore              = observe   printCore
+doCorePass (CoreDoRuleCheck phase pat)  = ruleCheckPass phase pat
+doCorePass CoreDoNothing                = return
+doCorePass (CoreDoPasses passes)        = runCorePasses passes
 
 #ifdef GHCI
-doCorePass _      (CoreDoPluginPass _ pass) = {-# SCC "Plugin" #-} pass
+doCorePass (CoreDoPluginPass _ pass) = {-# SCC "Plugin" #-} pass
 #endif
 
-doCorePass _      pass = pprPanic "doCorePass" (ppr pass)
+doCorePass pass = pprPanic "doCorePass" (ppr pass)
 \end{code}
 
 %************************************************************************
@@ -451,6 +461,21 @@ doPassDU do_pass = doPassDUM (\dflags us -> return . do_pass dflags us)
 
 doPassU :: (UniqSupply -> CoreProgram -> CoreProgram) -> ModGuts -> CoreM ModGuts
 doPassU do_pass = doPassDU (const do_pass)
+
+doPassDFM :: (DynFlags -> FamInstEnvs -> CoreProgram -> IO CoreProgram) -> ModGuts -> CoreM ModGuts
+doPassDFM do_pass guts = do
+    dflags <- getDynFlags
+    p_fam_env <- getPackageFamInstEnv
+    let fam_envs = (p_fam_env, mg_fam_inst_env guts)
+    doPassM (liftIO . do_pass dflags fam_envs) guts
+
+doPassDFU :: (DynFlags -> FamInstEnvs -> UniqSupply -> CoreProgram -> CoreProgram) -> ModGuts -> CoreM ModGuts
+doPassDFU do_pass guts = do
+    dflags <- getDynFlags
+    us     <- getUniqueSupplyM
+    p_fam_env <- getPackageFamInstEnv
+    let fam_envs = (p_fam_env, mg_fam_inst_env guts)
+    doPass (do_pass dflags fam_envs us) guts
 
 -- Most passes return no stats and don't change rules: these combinators
 -- let us lift them to the full blown ModGuts+CoreM world
@@ -603,7 +628,7 @@ simplifyPgmIO pass@(CoreDoSimplify max_iterations mode)
       , sz == sz     -- Force it
       = do {
                 -- Occurrence analysis
-           let {   -- Note [Vectorisation declarations and occurences]
+           let {   -- Note [Vectorisation declarations and occurrences]
                    -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                    -- During the 'InitialPhase' (i.e., before vectorisation), we need to make sure
                    -- that the right-hand sides of vectorisation declarations are taken into
@@ -667,7 +692,8 @@ simplifyPgmIO pass@(CoreDoSimplify max_iterations mode)
            let { binds2 = {-# SCC "ZapInd" #-} shortOutIndirections binds1 } ;
 
                 -- Dump the result of this iteration
-           end_iteration dflags pass iteration_no counts1 binds2 rules1 ;
+           dump_end_iteration dflags iteration_no counts1 binds2 rules1 ;
+           lintPassResult hsc_env pass binds2 ;
 
                 -- Loop
            do_iteration us2 (iteration_no + 1) (counts1:counts_so_far) binds2 rules1
@@ -684,11 +710,10 @@ simplifyPgmIO pass@(CoreDoSimplify max_iterations mode)
 simplifyPgmIO _ _ _ _ _ = panic "simplifyPgmIO"
 
 -------------------
-end_iteration :: DynFlags -> CoreToDo -> Int
+dump_end_iteration :: DynFlags -> Int
              -> SimplCount -> CoreProgram -> [CoreRule] -> IO ()
-end_iteration dflags pass iteration_no counts binds rules
-  = do { dumpPassResult dflags mb_flag hdr pp_counts binds rules
-       ; lintPassResult dflags pass binds }
+dump_end_iteration dflags iteration_no counts binds rules
+  = dumpPassResult dflags mb_flag hdr pp_counts binds rules
   where
     mb_flag | dopt Opt_D_dump_simpl_iterations dflags = Just Opt_D_dump_simpl_phases
             | otherwise                               = Nothing

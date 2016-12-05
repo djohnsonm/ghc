@@ -33,6 +33,8 @@ import qualified Control.Exception as Exception
 import Data.Maybe
 
 import Data.Char ( isSpace, toLower )
+import Data.Ord (comparing)
+import Control.Applicative (Applicative(..))
 import Control.Monad
 import System.Directory ( doesDirectoryExist, getDirectoryContents,
                           doesFileExist, renameFile, removeFile,
@@ -591,9 +593,9 @@ lookForPackageDBIn dir = do
   let path_dir = dir </> "package.conf.d"
   exists_dir <- doesDirectoryExist path_dir
   if exists_dir then return (Just path_dir) else do
-  let path_file = dir </> "package.conf"
-  exists_file <- doesFileExist path_file
-  if exists_file then return (Just path_file) else return Nothing
+    let path_file = dir </> "package.conf"
+    exists_file <- doesFileExist path_file
+    if exists_file then return (Just path_file) else return Nothing
 
 readParseDatabase :: Verbosity
                   -> Maybe (FilePath,Bool)
@@ -901,6 +903,10 @@ updateDBCache verbosity db = do
       if isPermissionError e
       then die (filename ++ ": you don't have permission to modify this file")
       else ioError e
+#ifndef mingw32_HOST_OS
+  status <- getFileStatus filename
+  setFileTimes (location db) (accessTime status) (modificationTime status)
+#endif
 
 -- -----------------------------------------------------------------------------
 -- Exposing, Hiding, Trusting, Distrusting, Unregistering are all similar
@@ -1008,7 +1014,8 @@ listPackages verbosity my_flags mPackageName mModuleName = do
                  then hPutStrLn stdout "    (no packages)"
                  else hPutStrLn stdout $ unlines (map ("    " ++) pp_pkgs)
            where
-                 pp_pkgs = map pp_pkg pkg_confs
+                 -- Sort using instance Ord PackageId
+                 pp_pkgs = map pp_pkg . sortBy (comparing installedPackageId) $ pkg_confs
                  pp_pkg p
                    | sourcePackageId p `elem` broken = printf "{%s}" doc
                    | exposed p = doc
@@ -1028,41 +1035,42 @@ listPackages verbosity my_flags mPackageName mModuleName = do
   if simple_output then show_simple stack else do
 
 #if defined(mingw32_HOST_OS) || defined(BOOTSTRAPPING)
-  mapM_ show_normal stack
+    mapM_ show_normal stack
 #else
-  let
-     show_colour withF db =
-         mconcat $ map (<#> termText "\n") $
-             (termText (location db) :
-                map (termText "   " <#>) (map pp_pkg (packages db)))
-        where
-                 pp_pkg p
-                   | sourcePackageId p `elem` broken = withF Red  doc
-                   | exposed p                       = doc
-                   | otherwise                       = withF Blue doc
-                   where doc | verbosity >= Verbose
-                             = termText (printf "%s (%s)" pkg ipid)
-                             | otherwise
-                             = termText pkg
-                          where
-                          InstalledPackageId ipid = installedPackageId p
-                          pkg = display (sourcePackageId p)
+    let
+       show_colour withF db =
+           mconcat $ map (<#> termText "\n") $
+               (termText (location db) :
+                  map (termText "   " <#>) (map pp_pkg (packages db)))
+          where
+                   pp_pkg p
+                     | sourcePackageId p `elem` broken = withF Red  doc
+                     | exposed p                       = doc
+                     | otherwise                       = withF Blue doc
+                     where doc | verbosity >= Verbose
+                               = termText (printf "%s (%s)" pkg ipid)
+                               | otherwise
+                               = termText pkg
+                            where
+                            InstalledPackageId ipid = installedPackageId p
+                            pkg = display (sourcePackageId p)
 
-  is_tty <- hIsTerminalDevice stdout
-  if not is_tty
-     then mapM_ show_normal stack
-     else do tty <- Terminfo.setupTermFromEnv
-             case Terminfo.getCapability tty withForegroundColor of
-                 Nothing -> mapM_ show_normal stack
-                 Just w  -> runTermOutput tty $ mconcat $
-                                                map (show_colour w) stack
+    is_tty <- hIsTerminalDevice stdout
+    if not is_tty
+       then mapM_ show_normal stack
+       else do tty <- Terminfo.setupTermFromEnv
+               case Terminfo.getCapability tty withForegroundColor of
+                   Nothing -> mapM_ show_normal stack
+                   Just w  -> runTermOutput tty $ mconcat $
+                                                  map (show_colour w) stack
 #endif
 
 simplePackageList :: [Flag] -> [InstalledPackageInfo] -> IO ()
 simplePackageList my_flags pkgs = do
    let showPkg = if FlagNamesOnly `elem` my_flags then display . pkgName
                                                   else display
-       strs = map showPkg $ sortBy compPkgIdVer $ map sourcePackageId pkgs
+       -- Sort using instance Ord PackageId
+       strs = map showPkg $ sort $ map sourcePackageId pkgs
    when (not (null pkgs)) $
       hPutStrLn stdout $ concat $ intersperse " " strs
 
@@ -1094,10 +1102,11 @@ latestPackage verbosity my_flags pkgid = do
      getPkgDatabases verbosity False True{-use cache-} False{-expand vars-} my_flags
 
   ps <- findPackages flag_db_stack (Id pkgid)
-  show_pkg (sortBy compPkgIdVer (map sourcePackageId ps))
+  case ps of
+    [] -> die "no matches"
+    _  -> show_pkg . maximum . map sourcePackageId $ ps
   where
-    show_pkg [] = die "no matches"
-    show_pkg pids = hPutStrLn stdout (display (last pids))
+    show_pkg pid = hPutStrLn stdout (display pid)
 
 -- -----------------------------------------------------------------------------
 -- Describe
@@ -1160,9 +1169,6 @@ realVersion pkgid = versionBranch (pkgVersion pkgid) /= []
 matchesPkg :: PackageArg -> InstalledPackageInfo -> Bool
 (Id pid)        `matchesPkg` pkg = pid `matches` sourcePackageId pkg
 (Substring _ m) `matchesPkg` pkg = m (display (sourcePackageId pkg))
-
-compPkgIdVer :: PackageIdentifier -> PackageIdentifier -> Ordering
-compPkgIdVer p1 p2 = pkgVersion p1 `compare` pkgVersion p2
 
 -- -----------------------------------------------------------------------------
 -- Field
@@ -1297,6 +1303,13 @@ type ValidateError   = (Force,String)
 type ValidateWarning = String
 
 newtype Validate a = V { runValidate :: IO (a, [ValidateError],[ValidateWarning]) }
+
+instance Functor Validate where
+    fmap = liftM
+
+instance Applicative Validate where
+    pure = return
+    (<*>) = ap
 
 instance Monad Validate where
    return a = V $ return (a, [], [])

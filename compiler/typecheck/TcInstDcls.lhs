@@ -10,7 +10,7 @@ TcInstDecls: Typechecking instance declarations
 -- The above warning supression flag is a temporary kludge.
 -- While working on this module you are encouraged to remove it and
 -- detab the module (please do the detabbing in a separate patch). See
---     http://hackage.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
 -- for details
 
 module TcInstDcls ( tcInstDecls1, tcInstDecls2 ) where
@@ -19,19 +19,15 @@ module TcInstDcls ( tcInstDecls1, tcInstDecls2 ) where
 
 import HsSyn
 import TcBinds
-import TcTyClsDecls( tcAddImplicits, tcAddTyFamInstCtxt, tcAddDataFamInstCtxt,
-                     tcSynFamInstDecl, 
-                     wrongKindOfFamily, tcFamTyPats, kcDataDefn, dataDeclChecks,
-                     tcConDecls, checkValidTyCon )
+import TcTyClsDecls
 import TcClassDcl( tcClassDecl2, 
-                   HsSigFun, lookupHsSig, mkHsSigFun, emptyHsSigs,
+                   HsSigFun, lookupHsSig, mkHsSigFun,
                    findMethodBind, instantiateMethod, tcInstanceMethodBody )
 import TcPat      ( addInlinePrags )
 import TcRnMonad
 import TcValidity
 import TcMType
 import TcType
-import Coercion( mkSingleCoAxiom, mkBranchedCoAxiom, pprCoAxBranch )
 import BuildTyCl
 import Inst
 import InstEnv
@@ -51,7 +47,6 @@ import Class
 import Var
 import VarEnv
 import VarSet 
-import Pair
 import CoreUnfold ( mkDFunUnfolding )
 import CoreSyn    ( Expr(Var, Type), CoreExpr, mkTyApps, mkVarApps )
 import PrelNames  ( tYPEABLE_INTERNAL, typeableClassName, oldTypeableClassNames )
@@ -69,9 +64,10 @@ import NameSet
 import Outputable
 import SrcLoc
 import Util
+import BooleanFormula ( isUnsatisfied, pprBooleanFormulaNice )
 
 import Control.Monad
-import Maybes     ( orElse, isNothing )
+import Maybes     ( isNothing, isJust, whenIsJust )
 \end{code}
 
 Typechecking instance declarations is done in two passes. The first
@@ -409,14 +405,13 @@ tcInstDecls1 tycl_decls inst_decls deriv_decls
                          ; return (gbl_env, emptyBag, emptyValBindsOut) }
                  else tcDeriving tycl_decls inst_decls deriv_decls
 
-       -- Remove any handwritten instance of poly-kinded Typeable and warn
-       ; dflags <- getDynFlags
-       ; when (wopt Opt_WarnTypeableInstances dflags) $
-              mapM_ (addWarnTc . instMsg) typeable_instances
+       -- Fail if there are any handwritten instance of poly-kinded Typeable
+       ; mapM_ (failWithTc . instMsg) typeable_instances
 
        -- Check that if the module is compiled with -XSafe, there are no
        -- hand written instances of old Typeable as then unsafe casts could be
        -- performed. Derived instances are OK.
+       ; dflags <- getDynFlags
        ; when (safeLanguageOn dflags) $
              mapM_ (\x -> when (typInstCheck x)
                                (addErrAt (getSrcSpan $ iSpec x) typInstErr))
@@ -447,7 +442,7 @@ tcInstDecls1 tycl_decls inst_decls deriv_decls
     typInstErr = ptext $ sLit $ "Can't create hand written instances of Typeable in Safe"
                               ++ " Haskell! Can only derive them"
 
-    instMsg i = hang (ptext (sLit $ "Typeable instances can only be derived; ignoring "
+    instMsg i = hang (ptext (sLit $ "Typeable instances can only be derived; replace "
                                  ++ "the following instance:"))
                      2 (pprInstance (iSpec i))
 
@@ -455,7 +450,7 @@ addClsInsts :: [InstInfo Name] -> TcM a -> TcM a
 addClsInsts infos thing_inside
   = tcExtendLocalInstEnv (map iSpec infos) thing_inside
 
-addFamInsts :: [FamInst Branched] -> TcM a -> TcM a
+addFamInsts :: [FamInst] -> TcM a -> TcM a
 -- Extend (a) the family instance envt
 --        (b) the type envt with stuff from data type decls
 addFamInsts fam_insts thing_inside
@@ -465,7 +460,7 @@ addFamInsts fam_insts thing_inside
        ; tcg_env <- tcAddImplicits things
        ; setGblEnv tcg_env thing_inside }
   where
-    axioms = map famInstAxiom fam_insts
+    axioms = map (toBranchedAxiom . famInstAxiom) fam_insts
     tycons = famInstsRepTyCons fam_insts
     things = map ATyCon tycons ++ map ACoAxiom axioms 
 \end{code}
@@ -489,7 +484,7 @@ the brutal solution will do.
 
 \begin{code}
 tcLocalInstDecl :: LInstDecl Name
-                -> TcM ([InstInfo Name], [FamInst Branched])
+                -> TcM ([InstInfo Name], [FamInst])
         -- A source-file instance declaration
         -- Type-check all the stuff before the "where"
         --
@@ -500,13 +495,13 @@ tcLocalInstDecl (L loc (TyFamInstD { tfid_inst = decl }))
 
 tcLocalInstDecl (L loc (DataFamInstD { dfid_inst = decl }))
   = do { fam_inst <- tcDataFamInstDecl Nothing (L loc decl)
-       ; return ([], [toBranchedFamInst fam_inst]) }
+       ; return ([], [fam_inst]) }
 
 tcLocalInstDecl (L loc (ClsInstD { cid_inst = decl }))
   = do { (insts, fam_insts) <- tcClsInstDecl (L loc decl)
-       ; return (insts, map toBranchedFamInst fam_insts) }
+       ; return (insts, fam_insts) }
 
-tcClsInstDecl :: LClsInstDecl Name -> TcM ([InstInfo Name], [FamInst Unbranched])
+tcClsInstDecl :: LClsInstDecl Name -> TcM ([InstInfo Name], [FamInst])
 tcClsInstDecl (L loc (ClsInstDecl { cid_poly_ty = poly_ty, cid_binds = binds
                                   , cid_sigs = uprags, cid_tyfam_insts = ats
                                   , cid_datafam_insts = adts }))
@@ -533,7 +528,7 @@ tcClsInstDecl (L loc (ClsInstDecl { cid_poly_ty = poly_ty, cid_binds = binds
         ; let defined_ats = mkNameSet $ map (tyFamInstDeclName . unLoc) ats
               defined_adts = mkNameSet $ map (unLoc . dfid_tycon . unLoc) adts
 
-              mk_deflt_at_instances :: ClassATItem -> TcM [FamInst Unbranched]
+              mk_deflt_at_instances :: ClassATItem -> TcM [FamInst]
               mk_deflt_at_instances (fam_tc, defs)
                  -- User supplied instances ==> everything is OK
                 | tyConName fam_tc `elemNameSet` defined_ats
@@ -558,7 +553,7 @@ tcClsInstDecl (L loc (ClsInstDecl { cid_poly_ty = poly_ty, cid_binds = binds
                      ; rep_tc_name <- newFamInstTyConName (noLoc (tyConName fam_tc)) pat_tys'
                      ; let axiom = mkSingleCoAxiom rep_tc_name tvs' fam_tc pat_tys' rhs'
                      ; ASSERT( tyVarsOfType rhs' `subVarSet` tv_set' ) 
-                       newFamInst SynFamilyInst False {- group -} axiom }
+                       newFamInst SynFamilyInst axiom }
 
         ; tyfam_insts1 <- mapM mk_deflt_at_instances (classATItems clas)
         
@@ -573,7 +568,12 @@ tcClsInstDecl (L loc (ClsInstDecl { cid_poly_ty = poly_ty, cid_binds = binds
               ispec 	= mkLocalInstance dfun overlap_flag tyvars' clas (substTys subst inst_tys)
                             -- Be sure to freshen those type variables, 
                             -- so they are sure not to appear in any lookup
-              inst_info = InstInfo { iSpec  = ispec, iBinds = VanillaInst binds uprags False }
+              inst_info = InstInfo { iSpec  = ispec
+                                   , iBinds = InstBindings
+                                     { ib_binds = binds
+                                     , ib_pragmas = uprags
+                                     , ib_extensions = []
+                                     , ib_standalone_deriving = False } }
 
         ; return ( [inst_info], tyfam_insts0 ++ concat tyfam_insts1 ++ datafam_insts) }
 
@@ -581,10 +581,10 @@ tcClsInstDecl (L loc (ClsInstDecl { cid_poly_ty = poly_ty, cid_binds = binds
 tcAssocTyDecl :: Class                   -- Class of associated type
               -> VarEnv Type             -- Instantiation of class TyVars
               -> LTyFamInstDecl Name     
-              -> TcM (FamInst Unbranched)
+              -> TcM (FamInst)
 tcAssocTyDecl clas mini_env ldecl
   = do { fam_inst <- tcTyFamInstDecl (Just (clas, mini_env)) ldecl
-       ; return $ toUnbranchedFamInst fam_inst }
+       ; return fam_inst }
 \end{code}
 
 %************************************************************************
@@ -620,53 +620,34 @@ tcFamInstDeclCombined mb_clsinfo fam_tc_lname
        ; return fam_tc }
 
 tcTyFamInstDecl :: Maybe (Class, VarEnv Type) -- the class & mini_env if applicable
-                -> LTyFamInstDecl Name -> TcM (FamInst Branched)
+                -> LTyFamInstDecl Name -> TcM FamInst
   -- "type instance"
-tcTyFamInstDecl mb_clsinfo (L loc decl@(TyFamInstDecl { tfid_group = group
-                                                      , tfid_eqns = eqns }))
+tcTyFamInstDecl mb_clsinfo (L loc decl@(TyFamInstDecl { tfid_eqn = eqn }))
   = setSrcSpan loc           $
     tcAddTyFamInstCtxt decl  $
-    do { let (eqn1:_) = eqns
-             fam_lname = tfie_tycon (unLoc eqn1)
+    do { let fam_lname = tfie_tycon (unLoc eqn)
        ; fam_tc <- tcFamInstDeclCombined mb_clsinfo fam_lname
 
          -- (0) Check it's an open type family
-       ; checkTc (isFamilyTyCon fam_tc) (notFamily fam_tc)
-       ; checkTc (isSynTyCon fam_tc) (wrongKindOfFamily fam_tc)
-       ; checkTc (isOpenSynFamilyTyCon fam_tc)
-                 (notOpenFamily fam_tc)
+       ; checkTc (isFamilyTyCon fam_tc)        (notFamily fam_tc)
+       ; checkTc (isSynFamilyTyCon fam_tc)     (wrongKindOfFamily fam_tc)
+       ; checkTc (isOpenSynFamilyTyCon fam_tc) (notOpenFamily fam_tc)
 
          -- (1) do the work of verifying the synonym group
-       ; co_ax_branches <- tcSynFamInstDecl fam_tc decl
+       ; co_ax_branch <- tcSynFamInstDecl fam_tc decl
 
-         -- (2) check for validity and inaccessibility
-       ; foldlM_ (check_valid_branch fam_tc) [] co_ax_branches
+         -- (2) check for validity
+       ; checkValidTyFamInst mb_clsinfo fam_tc co_ax_branch
 
          -- (3) construct coercion axiom
        ; rep_tc_name <- newFamInstAxiomName loc
                                             (tyFamInstDeclName decl)
-                                            (map cab_lhs co_ax_branches)
-       ; let axiom = mkBranchedCoAxiom rep_tc_name fam_tc co_ax_branches
-       ; newFamInst SynFamilyInst group axiom }
-    where 
-      check_valid_branch :: TyCon
-                         -> [CoAxBranch]     -- previous
-                         -> CoAxBranch       -- current
-                         -> TcM [CoAxBranch] -- current : previous
-      check_valid_branch fam_tc prev_branches cur_branch
-        = do { -- Check the well-formedness of the instance
-               checkValidTyFamInst mb_clsinfo fam_tc cur_branch
-
-               -- Check whether the branch is dominated by earlier
-               -- ones and hence is inaccessible
-             ; when (cur_branch `isDominatedBy` prev_branches) $
-               setSrcSpan (coAxBranchSpan cur_branch) $
-               addErrTc $ inaccessibleCoAxBranch fam_tc cur_branch
-
-             ; return $ cur_branch : prev_branches }
+                                            [co_ax_branch]
+       ; let axiom = mkUnbranchedCoAxiom rep_tc_name fam_tc co_ax_branch
+       ; newFamInst SynFamilyInst axiom }
 
 tcDataFamInstDecl :: Maybe (Class, VarEnv Type)
-                  -> LDataFamInstDecl Name -> TcM (FamInst Unbranched)
+                  -> LDataFamInstDecl Name -> TcM FamInst
   -- "newtype instance" and "data instance"
 tcDataFamInstDecl mb_clsinfo 
     (L loc decl@(DataFamInstDecl
@@ -683,7 +664,8 @@ tcDataFamInstDecl mb_clsinfo
        ; checkTc (isAlgTyCon fam_tc) (wrongKindOfFamily fam_tc)
 
          -- Kind check type patterns
-       ; tcFamTyPats fam_tc pats (kcDataDefn defn) $ 
+       ; tcFamTyPats (unLoc fam_tc_name) (tyConKind fam_tc) pats
+                     (kcDataDefn defn) $ 
            \tvs' pats' res_kind -> do
 
        { -- Check that left-hand side contains no type family applications
@@ -716,7 +698,8 @@ tcDataFamInstDecl mb_clsinfo
                     axiom    = mkSingleCoAxiom axiom_name eta_tvs fam_tc eta_pats 
                                                (mkTyConApp rep_tc (mkTyVarTys eta_tvs))
                     parent   = FamInstTyCon axiom fam_tc pats'
-                    rep_tc   = buildAlgTyCon rep_tc_name tvs' cType stupid_theta tc_rhs 
+                    roles    = map (const Nominal) tvs'
+                    rep_tc   = buildAlgTyCon rep_tc_name tvs' roles cType stupid_theta tc_rhs 
                                              Recursive 
                                              False      -- No promotable to the kind level
                                              h98_syntax parent
@@ -725,7 +708,7 @@ tcDataFamInstDecl mb_clsinfo
                  -- further instance might not introduce a new recursive
                  -- dependency.  (2) They are always valid loop breakers as
                  -- they involve a coercion.
-              ; fam_inst <- newFamInst (DataFamilyInst rep_tc) False axiom
+              ; fam_inst <- newFamInst (DataFamilyInst rep_tc) axiom
               ; return (rep_tc, fam_inst) }
 
          -- Remember to check validity; no recursion to worry about here
@@ -741,6 +724,7 @@ tcDataFamInstDecl mb_clsinfo
       , not (tv `elemVarSet` tyVarsOfTypes pats)
       = go tvs pats
     go tvs pats = (reverse tvs, reverse pats)
+
 \end{code}
 
 Note [Eta reduction for data family axioms]
@@ -764,6 +748,8 @@ Solution: eta-reduce both axioms, thus:
    axiom ax2 :: TInt ~ IO
 Now
    d' = d |> Monad (sym (ax2 ; ax1))
+
+This eta reduction happens both for data instances and newtype instances.
 
 See Note [Newtype eta] in TyCon.
 
@@ -793,7 +779,7 @@ tcInstDecls2 tycl_decls inst_decls
         ; let dm_ids = collectHsBindsBinders dm_binds
               -- Add the default method Ids (again)
               -- See Note [Default methods and instances]
-        ; inst_binds_s <- tcExtendLetEnv TopLevel dm_ids $
+        ; inst_binds_s <- tcExtendLetEnv TopLevel TopLevel dm_ids $
                           mapM tcInstDecl2 inst_decls
 
           -- Done
@@ -996,14 +982,12 @@ misplacedInstSig name hs_ty
   = vcat [ hang (ptext (sLit "Illegal type signature in instance declaration:"))
               2 (hang (pprPrefixName name)
                     2 (dcolon <+> ppr hs_ty))
-         , ptext (sLit "(Use -XInstanceSigs to allow this)") ]
+         , ptext (sLit "(Use InstanceSigs to allow this)") ]
 
 ------------------------------
 tcSpecInstPrags :: DFunId -> InstBindings Name
                 -> TcM ([Located TcSpecPrag], PragFun)
-tcSpecInstPrags _ (NewTypeDerived {})
-  = return ([], \_ -> [])
-tcSpecInstPrags dfun_id (VanillaInst binds uprags _)
+tcSpecInstPrags dfun_id (InstBindings { ib_binds = binds, ib_pragmas = uprags })
   = do { spec_inst_prags <- mapM (wrapLocM (tcSpecInst dfun_id)) $
                             filter isSpecInstLSig uprags
              -- The filter removes the pragmas for methods
@@ -1189,11 +1173,19 @@ tcInstanceMethods :: DFunId -> Class -> [TcTyVar]
         --      forall tvs. theta => ...
 tcInstanceMethods dfun_id clas tyvars dfun_ev_vars inst_tys
                   (spec_inst_prags, prag_fn)
-                  op_items (VanillaInst binds sigs standalone_deriv)
+                  op_items (InstBindings { ib_binds = binds
+                                         , ib_pragmas = sigs
+                                         , ib_extensions = exts
+                                         , ib_standalone_deriving
+                                              = standalone_deriv })
   = do { traceTc "tcInstMeth" (ppr sigs $$ ppr binds)
        ; let hs_sig_fn = mkHsSigFun sigs
-       ; mapAndUnzipM (tc_item hs_sig_fn) op_items }
+       ; checkMinimalDefinition
+       ; set_exts exts $ mapAndUnzipM (tc_item hs_sig_fn) op_items }
   where
+    set_exts :: [ExtensionFlag] -> TcM a -> TcM a
+    set_exts es thing = foldr setXOptM thing es
+    
     ----------------------
     tc_item :: HsSigFun -> (Id, DefMeth) -> TcM (Id, LHsBind Id)
     tc_item sig_fn (sel_id, dm_info)
@@ -1232,12 +1224,12 @@ tcInstanceMethods dfun_id clas tyvars dfun_ev_vars inst_tys
 
     tc_default sig_fn sel_id NoDefMeth     -- No default method at all
       = do { traceTc "tc_def: warn" (ppr sel_id)
-           ; warnMissingMethodOrAT "method" (idName sel_id)
            ; (meth_id, _) <- mkMethIds sig_fn clas tyvars dfun_ev_vars
                                        inst_tys sel_id
            ; dflags <- getDynFlags
-           ; return (meth_id, mkVarBind meth_id $
-                              mkLHsWrap lam_wrapper (error_rhs dflags)) }
+           ; return (meth_id,
+                     mkVarBind meth_id $
+                       mkLHsWrap lam_wrapper (error_rhs dflags)) }
       where
         error_rhs dflags = L inst_loc $ HsApp error_fun (error_msg dflags)
         error_fun    = L inst_loc $ wrapId (WpTyApp meth_tau) nO_METHOD_BINDING_ERROR_ID
@@ -1317,81 +1309,15 @@ tcInstanceMethods dfun_id clas tyvars dfun_ev_vars inst_tys
       | generated_code = addLandmarkErrCtxt (derivBindCtxt sel_id clas inst_tys rn_bind) thing
       | otherwise      = thing
 
+    ----------------------
 
-tcInstanceMethods dfun_id clas tyvars dfun_ev_vars inst_tys
-                  _ op_items (NewTypeDerived coi _)
+    -- check if one of the minimal complete definitions is satisfied
+    checkMinimalDefinition
+      = whenIsJust (isUnsatisfied methodExists (classMinimalDef clas)) $
+          warnUnsatisifiedMinimalDefinition
+      where
+      methodExists meth = isJust (findMethodBind meth binds)
 
--- Running example:
---   class Show b => Foo a b where
---     op :: a -> b -> b
---   newtype N a = MkN (Tree [a])
---   deriving instance (Show p, Foo Int p) => Foo Int (N p)
---               -- NB: standalone deriving clause means
---               --     that the contex is user-specified
--- Hence op :: forall a b. Foo a b => a -> b -> b
---
--- We're going to make an instance like
---   instance (Show p, Foo Int p) => Foo Int (N p)
---      op = $copT
---
---   $copT :: forall p. (Show p, Foo Int p) => Int -> N p -> N p
---   $copT p (d1:Show p) (d2:Foo Int p)
---     = op Int (Tree [p]) rep_d |> op_co
---     where
---       rep_d :: Foo Int (Tree [p]) = ...d1...d2...
---       op_co :: (Int -> Tree [p] -> Tree [p]) ~ (Int -> T p -> T p)
--- We get op_co by substituting [Int/a] and [co/b] in type for op
--- where co : [p] ~ T p
---
--- Notice that the dictionary bindings "..d1..d2.." must be generated
--- by the constraint solver, since the <context> may be
--- user-specified.
-
-  = do { rep_d_stuff <- checkConstraints InstSkol tyvars dfun_ev_vars $
-                        emitWanted ScOrigin rep_pred
-
-       ; mapAndUnzipM (tc_item rep_d_stuff) op_items }
-  where
-     loc = getSrcSpan dfun_id
-     Just (init_inst_tys, _) = snocView inst_tys
-     rep_ty   = pFst (tcCoercionKind co)  -- [p]
-     rep_pred = mkClassPred clas (init_inst_tys ++ [rep_ty])
-
-     -- co : [p] ~ T p
-     co = mkTcSymCo (mkTcInstCos coi (mkTyVarTys tyvars))
-     sig_fn = emptyHsSigs
-
-     ----------------
-     tc_item :: (TcEvBinds, EvVar) -> (Id, DefMeth) -> TcM (TcId, LHsBind TcId)
-     tc_item (rep_ev_binds, rep_d) (sel_id, _)
-       = do { (meth_id, local_meth_sig) <- mkMethIds sig_fn clas tyvars dfun_ev_vars
-                                                     inst_tys sel_id
-
-            ; let meth_rhs      = wrapId (mk_op_wrapper sel_id rep_d) sel_id
-                  local_meth_id = sig_id local_meth_sig
-                  meth_bind = mkVarBind local_meth_id (L loc meth_rhs)
-                  export = ABE { abe_wrap = idHsWrapper, abe_poly = meth_id
-                               , abe_mono = local_meth_id, abe_prags = noSpecPrags }
-                  bind = AbsBinds { abs_tvs = tyvars, abs_ev_vars = dfun_ev_vars
-                                   , abs_exports = [export]
-                                   , abs_ev_binds = rep_ev_binds
-                                   , abs_binds = unitBag $ meth_bind }
-
-            ; return (meth_id, L loc bind) }
-
-     ----------------
-     mk_op_wrapper :: Id -> EvVar -> HsWrapper
-     mk_op_wrapper sel_id rep_d
-       = WpCast (liftTcCoSubstWith sel_tvs (map mkTcReflCo init_inst_tys ++ [co])
-                                   local_meth_ty)
-         <.> WpEvApp (EvId rep_d)
-         <.> mkWpTyApps (init_inst_tys ++ [rep_ty])
-       where
-         (sel_tvs, sel_rho) = tcSplitForAllTys (idType sel_id)
-         (_, local_meth_ty) = tcSplitPredFunTy_maybe sel_rho
-                              `orElse` pprPanic "tcInstanceMethods" (ppr sel_id)
-
-------------------
 mkGenericDefMethBind :: Class -> [Type] -> Id -> Name -> TcM (LHsBind Name)
 mkGenericDefMethBind clas inst_tys sel_id dm_name
   = 	-- A generic default method
@@ -1402,7 +1328,7 @@ mkGenericDefMethBind clas inst_tys sel_id dm_name
 		   (vcat [ppr clas <+> ppr inst_tys,
 			  nest 2 (ppr sel_id <+> equals <+> ppr rhs)]))
 
-        ; return (noLoc $ mkTopFunBind (noLoc (idName sel_id))
+        ; return (noLoc $ mkTopFunBind Generated (noLoc (idName sel_id))
                                        [mkSimpleMatch [] rhs]) }
   where
     rhs = nlHsVar dm_name
@@ -1427,6 +1353,16 @@ warnMissingMethodOrAT what name
                                         -- Don't warn about _foo methods
                 (ptext (sLit "No explicit") <+> text what <+> ptext (sLit "or default declaration for")
                  <+> quotes (ppr name)) }
+
+warnUnsatisifiedMinimalDefinition :: ClassMinimalDef -> TcM ()
+warnUnsatisifiedMinimalDefinition mindef
+  = do { warn <- woptM Opt_WarnMissingMethods
+       ; warnTc warn message
+       }
+  where
+    message = vcat [ptext (sLit "No explicit implementation for")
+                   ,nest 2 $ pprBooleanFormulaNice mindef
+                   ]
 \end{code}
 
 Note [Export helper functions]
@@ -1549,7 +1485,8 @@ instDeclCtxt2 dfun_ty
     (_,_,cls,tys) = tcSplitDFunTy dfun_ty
 
 inst_decl_ctxt :: SDoc -> SDoc
-inst_decl_ctxt doc = ptext (sLit "In the instance declaration for") <+> quotes doc
+inst_decl_ctxt doc = hang (ptext (sLit "In the instance declaration for"))
+                        2 (quotes doc)
 
 badBootFamInstDeclErr :: SDoc
 badBootFamInstDeclErr
@@ -1574,12 +1511,7 @@ badFamInstDecl :: Located Name -> SDoc
 badFamInstDecl tc_name
   = vcat [ ptext (sLit "Illegal family instance for") <+>
            quotes (ppr tc_name)
-         , nest 2 (parens $ ptext (sLit "Use -XTypeFamilies to allow indexed type families")) ]
-
-inaccessibleCoAxBranch :: TyCon -> CoAxBranch -> SDoc
-inaccessibleCoAxBranch tc fi
-  = ptext (sLit "Inaccessible family instance equation:") $$
-      (pprCoAxBranch tc fi)
+         , nest 2 (parens $ ptext (sLit "Use TypeFamilies to allow indexed type families")) ]
 
 notOpenFamily :: TyCon -> SDoc
 notOpenFamily tc

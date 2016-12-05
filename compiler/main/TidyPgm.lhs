@@ -21,6 +21,8 @@ import CorePrep
 import CoreUtils
 import Literal
 import Rules
+import PatSyn
+import ConLike
 import CoreArity        ( exprArity, exprBotStrictness_maybe )
 import VarEnv
 import VarSet
@@ -30,7 +32,7 @@ import IdInfo
 import InstEnv
 import FamInstEnv
 import Type             ( tidyTopType )
-import Demand           ( appIsBottom, isTopSig, isBottomingSig )
+import Demand           ( appIsBottom, isNopSig, isBottomingSig )
 import BasicTypes
 import Name hiding (varName)
 import NameSet
@@ -58,7 +60,7 @@ import qualified ErrUtils as Err
 import Control.Monad
 import Data.Function
 import Data.List        ( sortBy )
-import Data.IORef       ( readIORef, writeIORef )
+import Data.IORef       ( atomicModifyIORef )
 \end{code}
 
 
@@ -129,17 +131,20 @@ mkBootModDetailsTc hsc_env
         TcGblEnv{ tcg_exports   = exports,
                   tcg_type_env  = type_env, -- just for the Ids
                   tcg_tcs       = tcs,
+                  tcg_patsyns   = pat_syns,
                   tcg_insts     = insts,
                   tcg_fam_insts = fam_insts
                 }
   = do  { let dflags = hsc_dflags hsc_env
         ; showPass dflags CoreTidy
 
-        ; let { insts'     = map (tidyClsInstDFun globaliseAndTidyId) insts
-              ; dfun_ids   = map instanceDFunId insts'
+        ; let { insts'      = map (tidyClsInstDFun globaliseAndTidyId) insts
               ; type_env1  = mkBootTypeEnv (availsToNameSet exports)
-                                (typeEnvIds type_env) tcs fam_insts
-              ; type_env'  = extendTypeEnvWithIds type_env1 dfun_ids
+                                           (typeEnvIds type_env) tcs fam_insts
+              ; pat_syns'   = map (tidyPatSynIds   globaliseAndTidyId) pat_syns
+              ; type_env2  = extendTypeEnvWithPatSyns pat_syns' type_env1
+              ; dfun_ids    = map instanceDFunId insts'
+              ; type_env'  = extendTypeEnvWithIds type_env2 dfun_ids
               }
         ; return (ModDetails { md_types     = type_env'
                              , md_insts     = insts'
@@ -152,7 +157,7 @@ mkBootModDetailsTc hsc_env
         }
   where
 
-mkBootTypeEnv :: NameSet -> [Id] -> [TyCon] -> [FamInst Branched] -> TypeEnv
+mkBootTypeEnv :: NameSet -> [Id] -> [TyCon] -> [FamInst] -> TypeEnv
 mkBootTypeEnv exports ids tcs fam_insts
   = tidyTypeEnv True $
        typeEnvFromEntities final_ids tcs fam_insts
@@ -215,7 +220,7 @@ Note [choosing external names]
 
 See also the section "Interface stability" in the
 RecompilationAvoidance commentary:
-  http://hackage.haskell.org/trac/ghc/wiki/Commentary/Compiler/RecompilationAvoidance
+  http://ghc.haskell.org/trac/ghc/wiki/Commentary/Compiler/RecompilationAvoidance
 
 First we figure out which Ids are "external" Ids.  An
 "external" Id is one that is visible from outside the compilation
@@ -296,6 +301,7 @@ tidyProgram hsc_env  (ModGuts { mg_module    = mod
                               , mg_insts     = insts
                               , mg_fam_insts = fam_insts
                               , mg_binds     = binds
+                              , mg_patsyns   = patsyns
                               , mg_rules     = imp_rules
                               , mg_vect_info = vect_info
                               , mg_anns      = anns
@@ -331,16 +337,13 @@ tidyProgram hsc_env  (ModGuts { mg_module    = mod
 
         ; let { final_ids  = [ id | id <- bindersOfBinds tidy_binds,
                                     isExternalName (idName id)]
+              ; type_env1  = extendTypeEnvWithIds type_env final_ids
 
-              ; tidy_type_env = tidyTypeEnv omit_prags
-                                      (extendTypeEnvWithIds type_env final_ids)
-
-              ; tidy_insts    = map (tidyClsInstDFun (lookup_dfun tidy_type_env)) insts
-                -- A DFunId will have a binding in tidy_binds, and so
-                -- will now be in final_env, replete with IdInfo
-                -- Its name will be unchanged since it was born, but
-                -- we want Global, IdInfo-rich (or not) DFunId in the
-                -- tidy_insts
+              ; tidy_insts = map (tidyClsInstDFun (lookup_aux_id tidy_type_env)) insts
+                -- A DFunId will have a binding in tidy_binds, and so will now be in
+                -- tidy_type_env, replete with IdInfo.  Its name will be unchanged since
+                -- it was born, but we want Global, IdInfo-rich (or not) DFunId in the
+                -- tidy_insts.  Similarly the Ids inside a PatSyn.
 
               ; tidy_rules = tidyRules tidy_env ext_rules
                 -- You might worry that the tidy_env contains IdInfo-rich stuff
@@ -348,6 +351,15 @@ tidyProgram hsc_env  (ModGuts { mg_module    = mod
                 -- empty
 
               ; tidy_vect_info = tidyVectInfo tidy_env vect_info
+
+                -- Tidy the Ids inside each PatSyn, very similarly to DFunIds
+                -- and then override the PatSyns in the type_env with the new tidy ones
+                -- This is really the only reason we keep mg_patsyns at all; otherwise
+                -- they could just stay in type_env
+              ; tidy_patsyns = map (tidyPatSynIds (lookup_aux_id tidy_type_env)) patsyns
+              ; type_env2    = extendTypeEnvWithPatSyns tidy_patsyns type_env1
+
+              ; tidy_type_env = tidyTypeEnv omit_prags type_env2
 
               -- See Note [Injecting implicit bindings]
               ; all_tidy_binds = implicit_binds ++ tidy_binds
@@ -363,7 +375,7 @@ tidyProgram hsc_env  (ModGuts { mg_module    = mod
               ; alg_tycons = filter isAlgTyCon (typeEnvTyCons type_env)
               }
 
-        ; endPass dflags CoreTidy all_tidy_binds tidy_rules
+        ; endPass hsc_env CoreTidy all_tidy_binds tidy_rules
 
           -- If the endPass didn't print the rules, but ddump-rules is
           -- on, print now
@@ -400,11 +412,11 @@ tidyProgram hsc_env  (ModGuts { mg_module    = mod
                               })
         }
 
-lookup_dfun :: TypeEnv -> Var -> Id
-lookup_dfun type_env dfun_id
-  = case lookupTypeEnv type_env (idName dfun_id) of
-        Just (AnId dfun_id') -> dfun_id'
-        _other -> pprPanic "lookup_dfun" (ppr dfun_id)
+lookup_aux_id :: TypeEnv -> Var -> Id
+lookup_aux_id type_env id
+  = case lookupTypeEnv type_env (idName id) of
+        Just (AnId id') -> id'
+        _other          -> pprPanic "lookup_axu_id" (ppr id)
 
 --------------------------
 tidyTypeEnv :: Bool       -- Compiling without -O, so omit prags
@@ -441,6 +453,10 @@ trimThing (AnId id)
 
 trimThing other_thing
   = other_thing
+
+extendTypeEnvWithPatSyns :: [PatSyn] -> TypeEnv -> TypeEnv
+extendTypeEnvWithPatSyns tidy_patsyns type_env
+  = extendTypeEnvList type_env [AConLike (PatSynCon ps) | ps <- tidy_patsyns ]
 \end{code}
 
 \begin{code}
@@ -554,7 +570,7 @@ Oh: two other reasons for injecting them late:
 There is one sort of implicit binding that is injected still later,
 namely those for data constructor workers. Reason (I think): it's
 really just a code generation trick.... binding itself makes no sense.
-See CorePrep Note [Data constructor workers].
+See Note [Data constructor workers] in CorePrep.
 
 \begin{code}
 getTyConImplicitBinds :: TyCon -> [CoreBind]
@@ -749,6 +765,13 @@ newtype DFFV a
       -> (VarSet, [Var])      -- Input State: (set, list) of free vars so far
       -> ((VarSet,[Var]),a))  -- Output state
 
+instance Functor DFFV where
+    fmap = liftM
+
+instance Applicative DFFV where
+    pure = return
+    (<*>) = ap
+
 instance Monad DFFV where
   return a = DFFV $ \_ st -> (st, a)
   (DFFV m) >>= k = DFFV $ \env st ->
@@ -815,12 +838,7 @@ dffvLetBndr vanilla_unfold id
        = case src of
            InlineRhs | vanilla_unfold -> dffvExpr rhs
                      | otherwise      -> return ()
-           InlineWrapper v            -> insert v
            _                          -> dffvExpr rhs
-            -- For a wrapper, externalise the wrapper id rather than the
-            -- fvs of the rhs.  The two usually come down to the same thing
-            -- but I've seen cases where we had a wrapper id $w but a
-            -- rhs where $w had been inlined; see Trac #3922
 
     go_unf (DFunUnfolding { df_bndrs = bndrs, df_args = args }) 
              = extendScopeList bndrs $ mapM_ dffvExpr args
@@ -857,9 +875,7 @@ tidyTopName mod nc_var maybe_ref occ_env id
   -- Now we get to the real reason that all this is in the IO Monad:
   -- we have to update the name cache in a nice atomic fashion
 
-  | local  && internal = do { nc <- readIORef nc_var
-                            ; let (nc', new_local_name) = mk_new_local nc
-                            ; writeIORef nc_var nc'
+  | local  && internal = do { new_local_name <- atomicModifyIORef nc_var mk_new_local
                             ; return (occ_env', new_local_name) }
         -- Even local, internal names must get a unique occurrence, because
         -- if we do -split-objs we externalise the name later, in the code generator
@@ -867,9 +883,7 @@ tidyTopName mod nc_var maybe_ref occ_env id
         -- Similarly, we must make sure it has a system-wide Unique, because
         -- the byte-code generator builds a system-wide Name->BCO symbol table
 
-  | local  && external = do { nc <- readIORef nc_var
-                            ; let (nc', new_external_name) = mk_new_external nc
-                            ; writeIORef nc_var nc'
+  | local  && external = do { new_external_name <- atomicModifyIORef nc_var mk_new_external
                             ; return (occ_env', new_external_name) }
 
   | otherwise = panic "tidyTopName"
@@ -1111,7 +1125,7 @@ tidyTopIdInfo dflags rhs_tidy_env name orig_rhs tidy_rhs idinfo show_unfold caf_
     mb_bot_str = exprBotStrictness_maybe orig_rhs
 
     sig = strictnessInfo idinfo
-    final_sig | not $ isTopSig sig 
+    final_sig | not $ isNopSig sig
                  = WARN( _bottom_hidden sig , ppr name ) sig 
                  -- try a cheap-and-cheerful bottom analyser
                  | Just (_, nsig) <- mb_bot_str = nsig

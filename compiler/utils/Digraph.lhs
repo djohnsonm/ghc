@@ -7,7 +7,7 @@
 -- The above warning supression flag is a temporary kludge.
 -- While working on this module you are encouraged to remove it and
 -- detab the module (please do the detabbing in a separate patch). See
---     http://hackage.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
 -- for details
 
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -15,9 +15,10 @@ module Digraph(
         Graph, graphFromVerticesAndAdjacency, graphFromEdgedVertices,
 
         SCC(..), Node, flattenSCC, flattenSCCs,
-        stronglyConnCompG, topologicalSortG, dfsTopSortG,
+        stronglyConnCompG,
+        topologicalSortG, dfsTopSortG,
         verticesG, edgesG, hasVertexG,
-        reachableG, transposeG,
+        reachableG, reachablesG, transposeG,
         outdegreeG, indegreeG,
         vertexGroupsG, emptyG,
         componentsG,
@@ -254,9 +255,13 @@ edges going from them to earlier ones.
 
 \begin{code}
 stronglyConnCompG :: Graph node -> [SCC node]
-stronglyConnCompG (Graph { gr_int_graph = graph, gr_vertex_to_node = vertex_fn }) = map decode forest
+stronglyConnCompG graph = decodeSccs graph forest
+  where forest = {-# SCC "Digraph.scc" #-} scc (gr_int_graph graph)
+
+decodeSccs :: Graph node -> Forest Vertex -> [SCC node]
+decodeSccs Graph { gr_int_graph = graph, gr_vertex_to_node = vertex_fn } forest
+  = map decode forest
   where
-    forest             = {-# SCC "Digraph.scc" #-} scc graph
     decode (Node v []) | mentions_itself v = CyclicSCC [vertex_fn v]
                        | otherwise         = AcyclicSCC (vertex_fn v)
     decode other = CyclicSCC (dec other [])
@@ -269,11 +274,12 @@ stronglyConnCompFromEdgedVertices
         :: Ord key
         => [Node key payload]
         -> [SCC payload]
-stronglyConnCompFromEdgedVertices = map (fmap get_node) . stronglyConnCompFromEdgedVerticesR
+stronglyConnCompFromEdgedVertices
+  = map (fmap get_node) . stronglyConnCompFromEdgedVerticesR
   where get_node (n, _, _) = n
 
 -- The "R" interface is used when you expect to apply SCC to
--- the (some of) the result of SCC, so you dont want to lose the dependency info
+-- (some of) the result of SCC, so you dont want to lose the dependency info
 stronglyConnCompFromEdgedVerticesR
         :: Ord key
         => [Node key payload]
@@ -301,7 +307,13 @@ dfsTopSortG graph =
 reachableG :: Graph node -> node -> [node]
 reachableG graph from = map (gr_vertex_to_node graph) result
   where from_vertex = expectJust "reachableG" (gr_node_to_vertex graph from)
-        result = {-# SCC "Digraph.reachable" #-} reachable (gr_int_graph graph) from_vertex
+        result = {-# SCC "Digraph.reachable" #-} reachable (gr_int_graph graph) [from_vertex]
+
+reachablesG :: Graph node -> [node] -> [node]
+reachablesG graph froms = map (gr_vertex_to_node graph) result
+  where result = {-# SCC "Digraph.reachable" #-} 
+                 reachable (gr_int_graph graph) vs
+        vs = [ v | Just v <- map (gr_node_to_vertex graph) froms ]
 
 hasVertexG :: Graph node -> node -> Bool
 hasVertexG graph node = isJust $ gr_node_to_vertex graph node
@@ -582,11 +594,11 @@ forward g tree pre = mapT select g
 ------------------------------------------------------------
 
 \begin{code}
-reachable    :: IntGraph -> Vertex -> [Vertex]
-reachable g v = preorderF (dfs g [v])
+reachable    :: IntGraph -> [Vertex] -> [Vertex]
+reachable g vs = preorderF (dfs g vs)
 
 path         :: IntGraph -> Vertex -> Vertex -> Bool
-path g v w    = w `elem` (reachable g v)
+path g v w    = w `elem` (reachable g [v])
 \end{code}
 
 ------------------------------------------------------------

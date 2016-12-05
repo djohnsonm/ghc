@@ -1,4 +1,4 @@
-%
+c%
 % (c) The University of Glasgow 2006
 % (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 %
@@ -12,9 +12,9 @@ module TcExpr ( tcPolyExpr, tcPolyExprNC, tcMonoExpr, tcMonoExprNC,
 
 #include "HsVersions.h"
 
-#ifdef GHCI     /* Only if bootstrapped */
-import {-# SOURCE #-}   TcSplice( tcSpliceExpr, tcBracket )
-import qualified DsMeta
+import {-# SOURCE #-}   TcSplice( tcSpliceExpr, tcTypedBracket, tcUntypedBracket )
+#ifdef GHCI
+import DsMeta( liftStringName, liftName )
 #endif
 
 import HsSyn
@@ -35,7 +35,9 @@ import TcMType
 import TcType
 import DsMonad hiding (Splice)
 import Id
+import ConLike
 import DataCon
+import PatSyn
 import RdrName
 import Name
 import TyCon
@@ -58,6 +60,9 @@ import Outputable
 import FastString
 import Control.Monad
 import Class(classTyCon)
+import Data.Function
+import Data.List
+import qualified Data.Set as Set
 \end{code}
 
 %************************************************************************
@@ -134,7 +139,7 @@ tcHole occ res_ty
       ; name <- newSysName occ
       ; let ev = mkLocalId name ty
       ; loc <- getCtLoc HoleOrigin
-      ; let can = CHoleCan { cc_ev = CtWanted ty ev, cc_loc = loc, cc_occ = occ }
+      ; let can = CHoleCan { cc_ev = CtWanted ty ev loc, cc_occ = occ }
       ; emitInsoluble can
       ; tcWrapResult (HsVar ev) ty res_ty }
 \end{code}
@@ -198,7 +203,7 @@ tcExpr (HsIPVar x) res_ty
   -- Coerces a dictionry for `IP "x" t` into `t`.
   fromDict ipClass x ty =
     case unwrapNewTyCon_maybe (classTyCon ipClass) of
-      Just (_,_,ax) -> HsWrap $ WpCast $ mkTcUnbranchedAxInstCo ax [x,ty]
+      Just (_,_,ax) -> HsWrap $ mkWpCast $ mkTcUnbranchedAxInstCo Representational ax [x,ty]
       Nothing       -> panic "The dictionary for `IP` is not a newtype?"
 
 tcExpr (HsLam match) res_ty
@@ -216,11 +221,14 @@ tcExpr e@(HsLamCase _ matches) res_ty
 tcExpr (ExprWithTySig expr sig_ty) res_ty
  = do { sig_tc_ty <- tcHsSigType ExprSigCtxt sig_ty
 
-      -- Remember to extend the lexical type-variable environment
       ; (gen_fn, expr')
             <- tcGen ExprSigCtxt sig_tc_ty $ \ skol_tvs res_ty ->
-               tcExtendTyVarEnv2 (hsExplicitTvs sig_ty `zip` skol_tvs) $
-                                -- See Note [More instantiated than scoped] in TcBinds
+
+                  -- Remember to extend the lexical type-variable environment
+                  -- See Note [More instantiated than scoped] in TcBinds
+               tcExtendTyVarEnv2 
+                  [(n,tv) | (Just n, tv) <- findScopedTyVars sig_ty sig_tc_ty skol_tvs] $
+
                tcMonoExprNC expr res_ty
 
       ; let inner_expr = ExprWithTySigOut (mkLHsWrap gen_fn expr') sig_ty
@@ -313,25 +321,26 @@ tcExpr (OpApp arg1 op fix arg2) res_ty
          -- arg1_ty = arg2_ty -> op_res_ty
          -- And arg2_ty maybe polymorphic; that's the point
 
-       -- Make sure that the argument and result types have kind '*'
+       -- Make sure that the argument type has kind '*'
        -- Eg we do not want to allow  (D#  $  4.0#)   Trac #5570
        --    (which gives a seg fault)
        -- We do this by unifying with a MetaTv; but of course
        -- it must allow foralls in the type it unifies with (hence PolyTv)!
+       --
+       -- The result type can have any kind (Trac #8739),
+       -- so we can just use res_ty
 
-       -- ($) :: forall ab. (a->b) -> a -> b
+       -- ($) :: forall (a:*) (b:Open). (a->b) -> a -> b
        ; a_ty <- newPolyFlexiTyVarTy
-       ; b_ty <- newPolyFlexiTyVarTy
        ; arg2' <- tcArg op (arg2, arg2_ty, 2)
 
-       ; co_res <- unifyType b_ty res_ty        -- b ~ res
-       ; co_a   <- unifyType arg2_ty   a_ty     -- arg2 ~ a
-       ; co_b   <- unifyType op_res_ty b_ty     -- op_res ~ b
+       ; co_a   <- unifyType arg2_ty   a_ty      -- arg2 ~ a
+       ; co_b   <- unifyType op_res_ty res_ty    -- op_res ~ res
        ; op_id  <- tcLookupId op_name
 
-       ; let op' = L loc (HsWrap (mkWpTyApps [a_ty, b_ty]) (HsVar op_id))
-       ; return $ mkHsWrapCo (co_res) $
-         OpApp (mkLHsWrapCo (mkTcFunCo co_a co_b) $
+       ; let op' = L loc (HsWrap (mkWpTyApps [a_ty, res_ty]) (HsVar op_id))
+       ; return $
+         OpApp (mkLHsWrapCo (mkTcFunCo Nominal co_a co_b) $
                 mkLHsWrapCo co_arg1 arg1')
                op' fix
                (mkLHsWrapCo co_a arg2') }
@@ -660,7 +669,7 @@ tcExpr (RecordUpd record_expr rbinds _ _ _) res_ty
         -- Step 2
         -- Check that at least one constructor has all the named fields
         -- i.e. has an empty set of bad fields returned by badFields
-        ; checkTc (not (null relevant_cons)) (badFieldsUpd rbinds)
+        ; checkTc (not (null relevant_cons)) (badFieldsUpd rbinds data_cons)
 
         -- STEP 3    Note [Criteria for update]
         -- Check that each updated field is polymorphic; that is, its type
@@ -717,7 +726,7 @@ tcExpr (RecordUpd record_expr rbinds _ _ _) res_ty
 
         -- Step 7: make a cast for the scrutinee, in the case that it's from a type family
         ; let scrut_co | Just co_con <- tyConFamilyCoercion_maybe tycon
-                       = WpCast (mkTcUnbranchedAxInstCo co_con scrut_inst_tys)
+                       = mkWpCast (mkTcUnbranchedAxInstCo Representational co_con scrut_inst_tys)
                        | otherwise
                        = idHsWrapper
         -- Phew!
@@ -794,13 +803,12 @@ tcExpr (PArrSeq _ _) _
 %************************************************************************
 
 \begin{code}
-#ifdef GHCI     /* Only if bootstrapped */
-        -- Rename excludes these cases otherwise
-tcExpr (HsSpliceE splice) res_ty = tcSpliceExpr splice res_ty
-tcExpr (HsBracket brack)  res_ty = tcBracket brack res_ty
-tcExpr e@(HsQuasiQuoteE _) _ =
-    pprPanic "Should never see HsQuasiQuoteE in type checker" (ppr e)
-#endif /* GHCI */
+tcExpr (HsSpliceE is_ty splice)  res_ty
+  = ASSERT( is_ty )   -- Untyped splices are expanced by the renamer
+   tcSpliceExpr splice res_ty
+
+tcExpr (HsBracket brack)         res_ty = tcTypedBracket   brack res_ty
+tcExpr (HsRnBracketOut brack ps) res_ty = tcUntypedBracket brack ps res_ty
 \end{code}
 
 
@@ -813,6 +821,7 @@ tcExpr e@(HsQuasiQuoteE _) _ =
 \begin{code}
 tcExpr other _ = pprPanic "tcMonoExpr" (ppr other)
   -- Include ArrForm, ArrApp, which shouldn't appear at all
+  -- Also HsTcBracketOut, HsQuasiQuoteE
 \end{code}
 
 
@@ -1060,9 +1069,9 @@ tcInferIdWithOrig orig id_name
     lookup_id
        = do { thing <- tcLookup id_name
             ; case thing of
-                 ATcId { tct_id = id, tct_level = lvl }
+                 ATcId { tct_id = id }
                    -> do { check_naughty id        -- Note [Local record selectors]
-                         ; checkThLocalId id lvl
+                         ; checkThLocalId id
                          ; return id }
 
                  AGlobal (AnId id)
@@ -1071,11 +1080,17 @@ tcInferIdWithOrig orig id_name
                         -- nor does it need the 'lifting' treatment
                         -- hence no checkTh stuff here
 
-                 AGlobal (ADataCon con) -> return (dataConWrapId con)
+                 AGlobal (AConLike cl) -> case cl of
+                     RealDataCon con -> return (dataConWrapId con)
+                     PatSynCon ps -> case patSynWrapper ps of
+                         Nothing -> failWithTc (bad_patsyn ps)
+                         Just id -> return id
 
                  other -> failWithTc (bad_lookup other) }
 
     bad_lookup thing = ppr thing <+> ptext (sLit "used where a value identifer was expected")
+
+    bad_patsyn name = ppr name <+>  ptext (sLit "used in an expression, but it's a non-bidirectional pattern synonym")
 
     check_naughty id
       | isNaughtyRecordSelector id = failWithTc (naughtyRecordSel id)
@@ -1232,15 +1247,14 @@ tcTagToEnum loc fun_name arg res_ty
         -- and returns a coercion between the two
     get_rep_ty ty tc tc_args
       | not (isFamilyTyCon tc)
-      = return (mkTcReflCo ty, tc, tc_args)
+      = return (mkTcNomReflCo ty, tc, tc_args)
       | otherwise
       = do { mb_fam <- tcLookupFamInst tc tc_args
            ; case mb_fam of
                Nothing -> failWithTc (tagToEnumError ty doc3)
                Just (FamInstMatch { fim_instance = rep_fam
-                                  , fim_index    = index
                                   , fim_tys      = rep_args })
-                   -> return ( mkTcSymCo (mkTcAxInstCo co_tc index rep_args)
+                   -> return ( mkTcSymCo (mkTcUnbranchedAxInstCo Nominal co_tc rep_args)
                              , rep_tc, rep_args )
                  where
                    co_tc  = famInstAxiom rep_fam
@@ -1261,48 +1275,34 @@ tagToEnumError ty what
 %************************************************************************
 
 \begin{code}
-checkThLocalId :: Id -> ThLevel -> TcM ()
+checkThLocalId :: Id -> TcM ()
 #ifndef GHCI  /* GHCI and TH is off */
 --------------------------------------
 -- Check for cross-stage lifting
-checkThLocalId _id _bind_lvl
+checkThLocalId _id
   = return ()
 
 #else         /* GHCI and TH is on */
-checkThLocalId id bind_lvl
-  = do  { use_stage <- getStage -- TH case
-        ; let use_lvl = thLevel use_stage
-        ; checkWellStaged (quotes (ppr id)) bind_lvl use_lvl
-        ; traceTc "thLocalId" (ppr id <+> ppr bind_lvl <+> ppr use_stage <+> ppr use_lvl)
-        ; when (use_lvl > bind_lvl) $
-          checkCrossStageLifting id bind_lvl use_stage }
+checkThLocalId id
+  = do  { mb_local_use <- getStageAndBindLevel (idName id)
+        ; case mb_local_use of
+             Just (top_lvl, bind_lvl, use_stage)
+                | thLevel use_stage > bind_lvl
+                , isNotTopLevel top_lvl
+                -> checkCrossStageLifting id use_stage
+             _  -> return ()   -- Not a locally-bound thing, or
+                               -- no cross-stage link
+    }
 
 --------------------------------------
-checkCrossStageLifting :: Id -> ThLevel -> ThStage -> TcM ()
--- We are inside brackets, and (use_lvl > bind_lvl)
--- Now we must check whether there's a cross-stage lift to do
+checkCrossStageLifting :: Id -> ThStage -> TcM ()
+-- If we are inside brackets, and (use_lvl > bind_lvl)
+-- we must check whether there's a cross-stage lift to do
 -- Examples   \x -> [| x |]
 --            [| map |]
+-- There is no error-checking to do, because the renamer did that
 
-checkCrossStageLifting _ _ Comp   = return ()
-checkCrossStageLifting _ _ Splice = return ()
-
-checkCrossStageLifting id _ (Brack _ ps_var lie_var)
-  | thTopLevelId id
-  =     -- Top-level identifiers in this module,
-        -- (which have External Names)
-        -- are just like the imported case:
-        -- no need for the 'lifting' treatment
-        -- E.g.  this is fine:
-        --   f x = x
-        --   g y = [| f 3 |]
-        -- But we do need to put f into the keep-alive
-        -- set, because after desugaring the code will
-        -- only mention f's *name*, not f itself.
-    keepAliveTc id
-
-  | otherwise   -- bind_lvl = outerLevel presumably,
-                -- but the Id is not bound at top level
+checkCrossStageLifting id (Brack _ (TcPending ps_var lie_var))
   =     -- Nested identifiers, such as 'x' in
         -- E.g. \x -> [| h x |]
         -- We must behave as if the reference to x was
@@ -1325,7 +1325,7 @@ checkCrossStageLifting id _ (Brack _ ps_var lie_var)
                                      -- See Note [Lifting strings]
                         ; return (HsVar sid) }
                   else
-                     setConstraintVar lie_var   $ do
+                     setConstraintVar lie_var   $
                           -- Put the 'lift' constraint into the right LIE
                      newMethodFromName (OccurrenceOf (idName id))
                                        DsMeta.liftName id_ty
@@ -1335,6 +1335,12 @@ checkCrossStageLifting id _ (Brack _ ps_var lie_var)
         ; writeMutVar ps_var ((idName id, nlHsApp (noLoc lift) (nlHsVar id)) : ps)
 
         ; return () }
+
+checkCrossStageLifting _ _ = return ()
+
+polySpliceErr :: Id -> SDoc
+polySpliceErr id
+  = ptext (sLit "Can't splice the polymorphic local variable") <+> quotes (ppr id)
 #endif /* GHCI */
 \end{code}
 
@@ -1405,7 +1411,7 @@ tcRecordBinds data_con arg_tys (HsRecFields rbinds dd)
                 --          (so the desugarer knows the type of local binder to make)
            ; return (Just (fld { hsRecFieldId = L loc field_id, hsRecFieldArg = rhs' })) }
       | otherwise
-      = do { addErrTc (badFieldCon data_con field_lbl)
+      = do { addErrTc (badFieldCon (RealDataCon data_con) field_lbl)
            ; return Nothing }
 
 checkMissingFields :: DataCon -> HsRecordBinds Name -> TcM ()
@@ -1510,11 +1516,81 @@ badFieldTypes prs
                          <> plural prs <> colon)
        2 (vcat [ ppr f <+> dcolon <+> ppr ty | (f,ty) <- prs ])
 
-badFieldsUpd :: HsRecFields Name a -> SDoc
-badFieldsUpd rbinds
+badFieldsUpd
+  :: HsRecFields Name a -- Field names that don't belong to a single datacon
+  -> [DataCon] -- Data cons of the type which the first field name belongs to
+  -> SDoc
+badFieldsUpd rbinds data_cons
   = hang (ptext (sLit "No constructor has all these fields:"))
-       2 (pprQuotedList (hsRecFields rbinds))
+       2 (pprQuotedList conflictingFields)
+          -- See Note [Finding the conflicting fields]
+  where
+    -- A (preferably small) set of fields such that no constructor contains
+    -- all of them.  See Note [Finding the conflicting fields]
+    conflictingFields = case nonMembers of
+        -- nonMember belongs to a different type.
+        (nonMember, _) : _ -> [aMember, nonMember]
+        [] -> let
+            -- All of rbinds belong to one type. In this case, repeatedly add
+            -- a field to the set until no constructor contains the set.
 
+            -- Each field, together with a list indicating which constructors
+            -- have all the fields so far.
+            growingSets :: [(Name, [Bool])]
+            growingSets = scanl1 combine membership
+            combine (_, setMem) (field, fldMem)
+              = (field, zipWith (&&) setMem fldMem)
+            in
+            -- Fields that don't change the membership status of the set
+            -- are redundant and can be dropped.
+            map (fst . head) $ groupBy ((==) `on` snd) growingSets
+
+    aMember = ASSERT( not (null members) ) fst (head members)
+    (members, nonMembers) = partition (or . snd) membership
+
+    -- For each field, which constructors contain the field?
+    membership :: [(Name, [Bool])]
+    membership = sortMembership $
+        map (\fld -> (fld, map (Set.member fld) fieldLabelSets)) $
+          hsRecFields rbinds
+
+    fieldLabelSets :: [Set.Set Name]
+    fieldLabelSets = map (Set.fromList . dataConFieldLabels) data_cons
+
+    -- Sort in order of increasing number of True, so that a smaller
+    -- conflicting set can be found.
+    sortMembership =
+      map snd .
+      sortBy (compare `on` fst) .
+      map (\ item@(_, membershipRow) -> (countTrue membershipRow, item))
+
+    countTrue = length . filter id
+\end{code}
+
+Note [Finding the conflicting fields]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we have
+  data A = A {a0, a1 :: Int}
+         | B {b0, b1 :: Int}
+and we see a record update
+  x { a0 = 3, a1 = 2, b0 = 4, b1 = 5 }
+Then we'd like to find the smallest subset of fields that no
+constructor has all of.  Here, say, {a0,b0}, or {a0,b1}, etc.
+We don't really want to report that no constructor has all of
+{a0,a1,b0,b1}, because when there are hundreds of fields it's 
+hard to see what was really wrong.
+
+We may need more than two fields, though; eg
+  data T = A { x,y :: Int, v::Int } 
+          | B { y,z :: Int, v::Int } 
+          | C { z,x :: Int, v::Int }
+with update
+   r { x=e1, y=e2, z=e3 }, we
+
+Finding the smallest subset is hard, so the code here makes
+a decent stab, no more.  See Trac #7989. 
+
+\begin{code}
 naughtyRecordSel :: TcId -> SDoc
 naughtyRecordSel sel_id
   = ptext (sLit "Cannot use record selector") <+> quotes (ppr sel_id) <+>
@@ -1542,10 +1618,4 @@ missingFields con fields
         <+> pprWithCommas ppr fields
 
 -- callCtxt fun args = ptext (sLit "In the call") <+> parens (ppr (foldl mkHsApp fun args))
-
-#ifdef GHCI
-polySpliceErr :: Id -> SDoc
-polySpliceErr id
-  = ptext (sLit "Can't splice the polymorphic local variable") <+> quotes (ppr id)
-#endif
 \end{code}

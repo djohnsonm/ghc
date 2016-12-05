@@ -25,6 +25,9 @@ Thumbs.db
 *.a
 *.o.cmd
 *.depend*
+*.dyn_o
+*.dyn_hi
+
 log
 tags
 
@@ -43,6 +46,7 @@ _darcs/
 # sub-repositories
 
 /ghc-tarballs/
+/libffi-tarballs/
 /libraries/array/
 /libraries/base/
 /libraries/deepseq/
@@ -51,6 +55,7 @@ _darcs/
 /libraries/extensible-exceptions/
 /libraries/filepath/
 /libraries/ghc-prim/
+/libraries/HaLVMCore
 /libraries/haskell2010/
 /libraries/haskell98/
 /libraries/hoopl/
@@ -66,8 +71,8 @@ _darcs/
 /libraries/template-haskell/
 /libraries/unix/
 /libraries/utf8-string/
+/libraries/XenDevice
 /nofib/
-/testsuite/
 /utils/haddock/
 /utils/hsc2hs/
 
@@ -172,3 +177,12 @@ _darcs/
 /extra-gcc-opts
 
 .tm_properties
+
+rts/xen/include/xen
+
+.fixed-gmp
+.halvm-base
+.linked-gmp
+.linked-rts
+.linked-xen
+.sync

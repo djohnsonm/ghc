@@ -25,6 +25,10 @@
 #include "Capability.h"
 #include "RtsSignals.h"
 
+#ifdef HaLVM_TARGET_OS
+#include "iomanager.h"
+#endif
+
 /* ticks left before next pre-emptive context switch */
 static int ticks_to_ctxt_switch = 0;
 
@@ -119,7 +123,7 @@ startTimer(void)
 void
 stopTimer(void)
 {
-    if (atomic_inc(&timer_disabled) == 1) {
+    if (atomic_inc(&timer_disabled, 1) == 1) {
         if (RtsFlags.MiscFlags.tickInterval != 0) {
             stopTicker();
         }

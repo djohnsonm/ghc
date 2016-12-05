@@ -801,6 +801,7 @@ labelType (CmmLabel _ _ CmmClosure)             = GcPtrLabel
 labelType (CmmLabel _ _ CmmCode)                = CodeLabel
 labelType (CmmLabel _ _ CmmInfo)                = DataLabel
 labelType (CmmLabel _ _ CmmEntry)               = CodeLabel
+labelType (CmmLabel _ _ CmmPrimCall)            = CodeLabel
 labelType (CmmLabel _ _ CmmRetInfo)             = DataLabel
 labelType (CmmLabel _ _ CmmRet)                 = CodeLabel
 labelType (RtsLabel (RtsSelectorInfoTable _ _)) = DataLabel
@@ -875,6 +876,8 @@ labelDynamic dflags this_pkg this_mod lbl =
             True
 
    PlainModuleInitLabel m -> not (gopt Opt_Static dflags) && this_pkg /= (modulePackageId m)
+
+   HpcTicksLabel m        -> not (gopt Opt_Static dflags) && this_pkg /= (modulePackageId m)
 
    -- Note that DynamicLinkerLabels do NOT require dynamic linking themselves.
    _                 -> False

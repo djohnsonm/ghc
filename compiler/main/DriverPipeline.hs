@@ -23,17 +23,26 @@ module DriverPipeline (
    compileOne, compileOne',
    link,
 
+        -- Exports for hooks to override runPhase and link
+   PhasePlus(..), CompPipeline(..), PipeEnv(..), PipeState(..),
+   phaseOutputFilename, getPipeState, getPipeEnv,
+   hscPostBackendPhase, getLocation, setModLocation, setDynFlags,
+   runPhase, exeFileName,
+   mkExtraObjToLinkIntoBinary, mkNoteObjsToLinkIntoBinary,
+   maybeCreateManifest, runPhase_MoveBinary,
+   linkingNeeded, checkLinkInfo
   ) where
 
 #include "HsVersions.h"
 
+import PipelineMonad
 import Packages
 import HeaderInfo
 import DriverPhases
 import SysTools
 import HscMain
 import Finder
-import HscTypes
+import HscTypes hiding ( Hsc )
 import Outputable
 import Module
 import UniqFM           ( eltsUFM )
@@ -52,6 +61,7 @@ import LlvmCodeGen      ( llvmFixupAsm )
 import MonadUtils
 import Platform
 import TcRnTypes
+import Hooks
 
 import Exception
 import Data.IORef       ( readIORef )
@@ -127,8 +137,19 @@ compileOne' m_tc_result mHscMessage
        location    = ms_location summary
        input_fn    = expectJust "compile:hs" (ml_hs_file location)
        input_fnpp  = ms_hspp_file summary
+       mod_graph   = hsc_mod_graph hsc_env0
+       needsTH     = any (xopt Opt_TemplateHaskell . ms_hspp_opts) mod_graph
+       needsQQ     = any (xopt Opt_QuasiQuotes     . ms_hspp_opts) mod_graph
+       needsLinker = needsTH || needsQQ
+       isDynWay    = any (== WayDyn) (ways dflags0)
+       isProfWay   = any (== WayProf) (ways dflags0)
+   -- #8180 - when using TemplateHaskell, switch on -dynamic-too so
+   -- the linker can correctly load the object files.
+   let dflags1 = if needsLinker && dynamicGhc && not isDynWay && not isProfWay
+                  then gopt_set dflags0 Opt_BuildDynamicToo
+                  else dflags0
 
-   debugTraceMsg dflags0 2 (text "compile: input file" <+> text input_fnpp)
+   debugTraceMsg dflags1 2 (text "compile: input file" <+> text input_fnpp)
 
    let basename = dropExtension input_fn
 
@@ -136,8 +157,8 @@ compileOne' m_tc_result mHscMessage
   -- This is needed when we try to compile the .hc file later, if it
   -- imports a _stub.h file that we created here.
    let current_dir = takeDirectory basename
-       old_paths   = includePaths dflags0
-       dflags      = dflags0 { includePaths = current_dir : old_paths }
+       old_paths   = includePaths dflags1
+       dflags      = dflags1 { includePaths = current_dir : old_paths }
        hsc_env     = hsc_env0 {hsc_dflags = dflags}
 
    -- Figure out what lang we're generating
@@ -169,7 +190,7 @@ compileOne' m_tc_result mHscMessage
    case e of
        Left iface ->
            do details <- genModDetails hsc_env iface
-              MASSERT (isJust maybe_old_linkable)
+              MASSERT(isJust maybe_old_linkable)
               return (HomeModInfo{ hm_details  = details,
                                    hm_iface    = iface,
                                    hm_linkable = maybe_old_linkable })
@@ -283,20 +304,26 @@ link :: GhcLink                 -- interactive or batch
 -- exports main, i.e., we have good reason to believe that linking
 -- will succeed.
 
-link LinkInMemory _ _ _
-    = if cGhcWithInterpreter == "YES"
-      then -- Not Linking...(demand linker will do the job)
-           return Succeeded
-      else panicBadLink LinkInMemory
+link ghcLink dflags
+  = lookupHook linkHook l dflags ghcLink dflags
+  where
+    l LinkInMemory _ _ _
+      = if cGhcWithInterpreter == "YES"
+        then -- Not Linking...(demand linker will do the job)
+             return Succeeded
+        else panicBadLink LinkInMemory
 
-link NoLink _ _ _
-   = return Succeeded
+    l NoLink _ _ _
+      = return Succeeded
 
-link LinkBinary dflags batch_attempt_linking hpt
-   = link' dflags batch_attempt_linking hpt
+    l LinkBinary dflags batch_attempt_linking hpt
+      = link' dflags batch_attempt_linking hpt
 
-link LinkDynLib dflags batch_attempt_linking hpt
-   = link' dflags batch_attempt_linking hpt
+    l LinkStaticLib dflags batch_attempt_linking hpt
+      = link' dflags batch_attempt_linking hpt
+
+    l LinkDynLib dflags batch_attempt_linking hpt
+      = link' dflags batch_attempt_linking hpt
 
 panicBadLink :: GhcLink -> a
 panicBadLink other = panic ("link: GHC not built to link this way: " ++
@@ -311,6 +338,10 @@ link' dflags batch_attempt_linking hpt
    | batch_attempt_linking
    = do
         let
+            staticLink = case ghcLink dflags of
+                          LinkStaticLib -> True
+                          _ -> platformBinariesAreStaticLibs (targetPlatform dflags)
+
             home_mod_infos = eltsUFM hpt
 
             -- the packages we depend on
@@ -330,9 +361,9 @@ link' dflags batch_attempt_linking hpt
         let getOfiles (LM _ _ us) = map nameOfObject (filter isObject us)
             obj_files = concatMap getOfiles linkables
 
-            exe_file = exeFileName dflags
+            exe_file = exeFileName staticLink dflags
 
-        linking_needed <- linkingNeeded dflags linkables pkg_deps
+        linking_needed <- linkingNeeded dflags staticLink linkables pkg_deps
 
         if not (gopt Opt_ForceRecomp dflags) && not linking_needed
            then do debugTraceMsg dflags 2 (text exe_file <+> ptext (sLit "is up to date, linking not required."))
@@ -343,9 +374,10 @@ link' dflags batch_attempt_linking hpt
 
         -- Don't showPass in Batch mode; doLink will do that for us.
         let link = case ghcLink dflags of
-                LinkBinary  -> linkBinary
-                LinkDynLib  -> linkDynLibCheck
-                other       -> panicBadLink other
+                LinkBinary    -> linkBinary
+                LinkStaticLib -> linkStaticLibCheck
+                LinkDynLib    -> linkDynLibCheck
+                other         -> panicBadLink other
         link dflags obj_files pkg_deps
 
         debugTraceMsg dflags 3 (text "link: done")
@@ -359,12 +391,12 @@ link' dflags batch_attempt_linking hpt
         return Succeeded
 
 
-linkingNeeded :: DynFlags -> [Linkable] -> [PackageId] -> IO Bool
-linkingNeeded dflags linkables pkg_deps = do
+linkingNeeded :: DynFlags -> Bool -> [Linkable] -> [PackageId] -> IO Bool
+linkingNeeded dflags staticLink linkables pkg_deps = do
         -- if the modification time on the executable is later than the
         -- modification times on all of the objects and libraries, then omit
         -- linking (unless the -fforce-recomp flag was given).
-  let exe_file = exeFileName dflags
+  let exe_file = exeFileName staticLink dflags
   e_exe_time <- tryIO $ getModificationUTCTime exe_file
   case e_exe_time of
     Left _  -> return True
@@ -447,7 +479,7 @@ compileFile hsc_env stop_phase (src, mb_phase) = do
         throwGhcExceptionIO (CmdLineError ("does not exist: " ++ src))
 
    let
-        dflags = hsc_dflags hsc_env
+        dflags    = hsc_dflags hsc_env
         split     = gopt Opt_SplitObjs dflags
         mb_o_file = outputFile dflags
         ghc_link  = ghcLink dflags      -- Set by -c or -no-link
@@ -466,8 +498,8 @@ compileFile hsc_env stop_phase (src, mb_phase) = do
          | otherwise = Persistent
 
         stop_phase' = case stop_phase of
-                        As | split -> SplitAs
-                        _          -> stop_phase
+                        As _ | split -> SplitAs
+                        _            -> stop_phase
 
    ( _, out_file) <- runPipeline stop_phase' hsc_env
                             (src, fmap RealPhase mb_phase) Nothing output
@@ -482,27 +514,14 @@ doLink dflags stop_phase o_files
 
   | otherwise
   = case ghcLink dflags of
-        NoLink     -> return ()
-        LinkBinary -> linkBinary      dflags o_files []
-        LinkDynLib -> linkDynLibCheck dflags o_files []
-        other      -> panicBadLink other
+        NoLink        -> return ()
+        LinkBinary    -> linkBinary         dflags o_files []
+        LinkStaticLib -> linkStaticLibCheck dflags o_files []
+        LinkDynLib    -> linkDynLibCheck    dflags o_files []
+        other         -> panicBadLink other
 
 
 -- ---------------------------------------------------------------------------
-
-data PipelineOutput
-  = Temporary
-        -- ^ Output should be to a temporary file: we're going to
-        -- run more compilation steps on this output later.
-  | Persistent
-        -- ^ We want a persistent file, i.e. a file in the current directory
-        -- derived from the input filename, but with the appropriate extension.
-        -- eg. in "ghc -c Foo.hs" the output goes into ./Foo.o.
-  | SpecificFile
-        -- ^ The output must go into the specific outputFile in DynFlags.
-        -- We don't store the filename in the constructor as it changes
-        -- when doing -dynamic-too.
-    deriving Show
 
 -- | Run a compilation pipeline, consisting of multiple phases.
 --
@@ -580,14 +599,16 @@ runPipeline stop_phase hsc_env0 (input_fn, mb_phase)
          -- -dynamic-too, but couldn't do the -dynamic-too fast
          -- path, then rerun the pipeline for the dyn way
          let dflags = extractDynFlags hsc_env
-         when isHaskellishFile $ whenCannotGenerateDynamicToo dflags $ do
-             debugTraceMsg dflags 4
-                 (text "Running the pipeline again for -dynamic-too")
-             let dflags' = doDynamicToo dflags
-             hsc_env' <- newHscEnv dflags'
-             _ <- runPipeline' start_phase hsc_env' env input_fn
-                               maybe_loc maybe_stub_o
-             return ()
+         -- NB: Currently disabled on Windows (ref #7134, #8228, and #5987)
+         when (not $ platformOS (targetPlatform dflags) == OSMinGW32) $ do
+           when isHaskellishFile $ whenCannotGenerateDynamicToo dflags $ do
+               debugTraceMsg dflags 4
+                   (text "Running the pipeline again for -dynamic-too")
+               let dflags' = dynamicTooMkDynamicDynFlags dflags
+               hsc_env' <- newHscEnv dflags'
+               _ <- runPipeline' start_phase hsc_env' env input_fn
+                                 maybe_loc maybe_stub_o
+               return ()
          return r
 
 runPipeline'
@@ -605,76 +626,6 @@ runPipeline' start_phase hsc_env env input_fn
   let state = PipeState{ hsc_env, maybe_loc, maybe_stub_o = maybe_stub_o }
 
   evalP (pipeLoop start_phase input_fn) env state
-
--- -----------------------------------------------------------------------------
--- The pipeline uses a monad to carry around various bits of information
-
--- PipeEnv: invariant information passed down
-data PipeEnv = PipeEnv {
-       pe_isHaskellishFile :: Bool,
-       stop_phase   :: Phase,       -- ^ Stop just before this phase
-       src_filename :: String,      -- ^ basename of original input source
-       src_basename :: String,      -- ^ basename of original input source
-       src_suffix   :: String,      -- ^ its extension
-       output_spec  :: PipelineOutput -- ^ says where to put the pipeline output
-  }
-
--- PipeState: information that might change during a pipeline run
-data PipeState = PipeState {
-       hsc_env   :: HscEnv,
-          -- ^ only the DynFlags change in the HscEnv.  The DynFlags change
-          -- at various points, for example when we read the OPTIONS_GHC
-          -- pragmas in the Cpp phase.
-       maybe_loc :: Maybe ModLocation,
-          -- ^ the ModLocation.  This is discovered during compilation,
-          -- in the Hsc phase where we read the module header.
-       maybe_stub_o :: Maybe FilePath
-          -- ^ the stub object.  This is set by the Hsc phase if a stub
-          -- object was created.  The stub object will be joined with
-          -- the main compilation object using "ld -r" at the end.
-  }
-
-getPipeEnv :: CompPipeline PipeEnv
-getPipeEnv = P $ \env state -> return (state, env)
-
-getPipeState :: CompPipeline PipeState
-getPipeState = P $ \_env state -> return (state, state)
-
-instance HasDynFlags CompPipeline where
-    getDynFlags = P $ \_env state -> return (state, hsc_dflags (hsc_env state))
-
-setDynFlags :: DynFlags -> CompPipeline ()
-setDynFlags dflags = P $ \_env state ->
-  return (state{hsc_env= (hsc_env state){ hsc_dflags = dflags }}, ())
-
-setModLocation :: ModLocation -> CompPipeline ()
-setModLocation loc = P $ \_env state ->
-  return (state{ maybe_loc = Just loc }, ())
-
-setStubO :: FilePath -> CompPipeline ()
-setStubO stub_o = P $ \_env state ->
-  return (state{ maybe_stub_o = Just stub_o }, ())
-
-newtype CompPipeline a = P { unP :: PipeEnv -> PipeState -> IO (PipeState, a) }
-
-evalP :: CompPipeline a -> PipeEnv -> PipeState -> IO a
-evalP f env st = liftM snd $ unP f env st
-
-instance Monad CompPipeline where
-  return a = P $ \_env state -> return (state, a)
-  P m >>= k = P $ \env state -> do (state',a) <- m env state
-                                   unP (k a) env state'
-
-instance MonadIO CompPipeline where
-    liftIO m = P $ \_env state -> do a <- m; return (state, a)
-
-phaseOutputFilename :: Phase{-next phase-} -> CompPipeline FilePath
-phaseOutputFilename next_phase = do
-  PipeEnv{stop_phase, src_basename, output_spec} <- getPipeEnv
-  PipeState{maybe_loc, hsc_env} <- getPipeState
-  let dflags = hsc_dflags hsc_env
-  liftIO $ getOutputFilename stop_phase output_spec
-                             src_basename dflags next_phase maybe_loc
 
 -- ---------------------------------------------------------------------------
 -- outer pipeline loop
@@ -719,12 +670,12 @@ pipeLoop phase input_fn = do
    _
      -> do liftIO $ debugTraceMsg dflags 4
                                   (ptext (sLit "Running phase") <+> ppr phase)
-           (next_phase, output_fn) <- runPhase phase input_fn dflags
+           (next_phase, output_fn) <- runHookedPhase phase input_fn dflags
            r <- pipeLoop next_phase output_fn
            case phase of
                HscOut {} ->
                    whenGeneratingDynamicToo dflags $ do
-                       setDynFlags $ doDynamicToo dflags
+                       setDynFlags $ dynamicTooMkDynamicDynFlags dflags
                        -- TODO shouldn't ignore result:
                        _ <- pipeLoop phase input_fn
                        return ()
@@ -732,10 +683,23 @@ pipeLoop phase input_fn = do
                    return ()
            return r
 
+runHookedPhase :: PhasePlus -> FilePath -> DynFlags
+               -> CompPipeline (PhasePlus, FilePath)
+runHookedPhase pp input dflags =
+  lookupHook runPhaseHook runPhase dflags pp input dflags
+
 -- -----------------------------------------------------------------------------
 -- In each phase, we need to know into what filename to generate the
 -- output.  All the logic about which filenames we generate output
 -- into is embodied in the following function.
+
+phaseOutputFilename :: Phase{-next phase-} -> CompPipeline FilePath
+phaseOutputFilename next_phase = do
+  PipeEnv{stop_phase, src_basename, output_spec} <- getPipeEnv
+  PipeState{maybe_loc, hsc_env} <- getPipeState
+  let dflags = hsc_dflags hsc_env
+  liftIO $ getOutputFilename stop_phase output_spec
+                             src_basename dflags next_phase maybe_loc
 
 getOutputFilename
   :: Phase -> PipelineOutput -> String
@@ -766,7 +730,7 @@ getOutputFilename stop_phase output basename dflags next_phase maybe_location
           -- sometimes, we keep output from intermediate stages
           keep_this_output =
                case next_phase of
-                       As      | keep_s     -> True
+                       As _    | keep_s     -> True
                        LlvmOpt | keep_bc    -> True
                        HCc     | keep_hc    -> True
                        _other               -> False
@@ -784,13 +748,6 @@ getOutputFilename stop_phase output basename dflags next_phase maybe_location
              | Just loc <- maybe_location = ml_obj_file loc
              | Just d <- odir = d </> persistent
              | otherwise      = persistent
-
-data PhasePlus = RealPhase Phase
-               | HscOut HscSource ModuleName HscStatus
-
-instance Outputable PhasePlus where
-    ppr (RealPhase p) = ppr p
-    ppr (HscOut {}) = text "HscOut"
 
 -- -----------------------------------------------------------------------------
 -- | Each phase in the pipeline returns the next phase to execute, and the
@@ -1088,7 +1045,7 @@ runPhase (RealPhase cc_phase) input_fn dflags
         -- files; this is the Value Add(TM) that using ghc instead of
         -- gcc gives you :)
         pkg_include_dirs <- liftIO $ getPackageIncludePath dflags pkgs
-        let include_paths = foldr (\ x xs -> "-I" : x : xs) []
+        let include_paths = foldr (\ x xs -> ("-I" ++ x) : xs) []
                               (cmdline_include_paths ++ pkg_include_dirs)
 
         let gcc_extra_viac_flags = extraGccViaCFlags dflags
@@ -1116,11 +1073,12 @@ runPhase (RealPhase cc_phase) input_fn dflags
             split_opt | hcc && split_objs = [ "-DUSE_SPLIT_MARKERS" ]
                       | otherwise         = [ ]
 
-        let cc_opt | optLevel dflags >= 2 = "-O2"
-                   | otherwise            = "-O"
+        let cc_opt | optLevel dflags >= 2 = [ "-O2" ]
+                   | optLevel dflags >= 1 = [ "-O" ]
+                   | otherwise            = []
 
         -- Decide next phase
-        let next_phase = As
+        let next_phase = As False
         output_fn <- phaseOutputFilename next_phase
 
         let
@@ -1140,10 +1098,10 @@ runPhase (RealPhase cc_phase) input_fn dflags
                 -- very weakly typed, being derived from C--.
                 ["-fno-strict-aliasing"]
 
-        let gcc_lang_opt | cc_phase `eqPhase` Ccpp  = "c++"
-                         | cc_phase `eqPhase` Cobjc = "objective-c"
+        let gcc_lang_opt | cc_phase `eqPhase` Ccpp    = "c++"
+                         | cc_phase `eqPhase` Cobjc   = "objective-c"
                          | cc_phase `eqPhase` Cobjcpp = "objective-c++"
-                         | otherwise                = "c"
+                         | otherwise                  = "c"
         liftIO $ SysTools.runCc dflags (
                 -- force the C compiler to interpret this file as C when
                 -- compiling .hc files, by adding the -x c option.
@@ -1187,7 +1145,8 @@ runPhase (RealPhase cc_phase) input_fn dflags
                              then gcc_extra_viac_flags ++ more_hcc_opts
                              else [])
                        ++ verbFlags
-                       ++ [ "-S", cc_opt ]
+                       ++ [ "-S" ]
+                       ++ cc_opt
                        ++ [ "-D__GLASGOW_HASKELL__="++cProjectVersionInt ]
                        ++ framework_paths
                        ++ split_opt
@@ -1231,7 +1190,7 @@ runPhase (RealPhase Splitter) input_fn dflags
 -- As, SpitAs phase : Assembler
 
 -- This is for calling the assembler on a regular assembly file (not split).
-runPhase (RealPhase As) input_fn dflags
+runPhase (RealPhase (As with_cpp)) input_fn dflags
   = do
         -- LLVM from version 3.0 onwards doesn't support the OS X system
         -- assembler, so we use clang as the assembler instead. (#5636)
@@ -1249,6 +1208,7 @@ runPhase (RealPhase As) input_fn dflags
 
         as_prog <- whichAsProg
         let cmdline_include_paths = includePaths dflags
+        let pic_c_flags = picCCOpts dflags
 
         next_phase <- maybeMergeStub
         output_fn <- phaseOutputFilename next_phase
@@ -1257,9 +1217,13 @@ runPhase (RealPhase As) input_fn dflags
         -- might be a hierarchical module.
         liftIO $ createDirectoryIfMissing True (takeDirectory output_fn)
 
+        ccInfo <- liftIO $ getCompilerInfo dflags
         let runAssembler inputFilename outputFilename
                 = liftIO $ as_prog dflags
                        ([ SysTools.Option ("-I" ++ p) | p <- cmdline_include_paths ]
+
+                       -- See Note [-fPIC for assembler]
+                       ++ map SysTools.Option pic_c_flags
 
         -- We only support SparcV9 and better because V8 lacks an atomic CAS
         -- instruction so we have to make sure that the assembler accepts the
@@ -1271,8 +1235,13 @@ runPhase (RealPhase As) input_fn dflags
                        ++ (if platformArch (targetPlatform dflags) == ArchSPARC
                            then [SysTools.Option "-mcpu=v9"]
                            else [])
-
-                       ++ [ SysTools.Option "-x", SysTools.Option "assembler-with-cpp"
+                       ++ (if any (ccInfo ==) [Clang, AppleClang, AppleClang51]
+                            then [SysTools.Option "-Qunused-arguments"]
+                            else [])
+                       ++ [ SysTools.Option "-x"
+                          , if with_cpp
+                              then SysTools.Option "assembler-with-cpp"
+                              else SysTools.Option "assembler"
                           , SysTools.Option "-c"
                           , SysTools.FileOption "" inputFilename
                           , SysTools.Option "-o"
@@ -1297,6 +1266,9 @@ runPhase (RealPhase SplitAs) _input_fn dflags
             osuf = objectSuf dflags
             split_odir  = base_o ++ "_" ++ osuf ++ "_split"
 
+        let pic_c_flags = picCCOpts dflags
+
+        -- this also creates the hierarchy
         liftIO $ createDirectoryIfMissing True split_odir
 
         -- remove M_split/ *.o, because we're going to archive M_split/ *.o
@@ -1328,6 +1300,9 @@ runPhase (RealPhase SplitAs) _input_fn dflags
                           (if platformArch (targetPlatform dflags) == ArchSPARC
                            then [SysTools.Option "-mcpu=v9"]
                            else []) ++
+
+                          -- See Note [-fPIC for assembler]
+                          map SysTools.Option pic_c_flags ++
 
                           [ SysTools.Option "-c"
                           , SysTools.Option "-o"
@@ -1378,7 +1353,7 @@ runPhase (RealPhase LlvmOpt) input_fn dflags
         -- passes only, so if the user is passing us extra options we assume
         -- they know what they are doing and don't get in the way.
         optFlag  = if null (getOpts dflags opt_lo)
-                       then [SysTools.Option (llvmOpts !! opt_lvl)]
+                       then map SysTools.Option $ words (llvmOpts ver !! opt_lvl)
                        else []
         tbaa | ver < 29                 = "" -- no tbaa in 2.8 and earlier
              | gopt Opt_LlvmTBAA dflags = "--enable-tbaa=true"
@@ -1398,7 +1373,11 @@ runPhase (RealPhase LlvmOpt) input_fn dflags
   where 
         -- we always (unless -optlo specified) run Opt since we rely on it to
         -- fix up some pretty big deficiencies in the code we generate
-        llvmOpts = ["-mem2reg", "-O1", "-O2"]
+        llvmOpts ver = [ "-mem2reg -globalopt"
+                       , if ver >= 34 then "-O1 -globalopt" else "-O1"
+                         -- LLVM 3.4 -O1 doesn't eliminate aliases reliably (bug #8855)
+                       , "-O2"
+                       ]
 
 -----------------------------------------------------------------------------
 -- LlvmLlc phase
@@ -1422,7 +1401,7 @@ runPhase (RealPhase LlvmLlc) input_fn dflags
     let next_phase = case gopt Opt_NoLlvmMangler dflags of
                          False                            -> LlvmMangle
                          True | gopt Opt_SplitObjs dflags -> Splitter
-                         True                             -> As
+                         True                             -> As False
                         
     output_fn <- phaseOutputFilename next_phase
 
@@ -1434,7 +1413,10 @@ runPhase (RealPhase LlvmLlc) input_fn dflags
                 ++ [SysTools.Option tbaa]
                 ++ map SysTools.Option fpOpts
                 ++ map SysTools.Option abiOpts
-                ++ map SysTools.Option sseOpts)
+                ++ map SysTools.Option sseOpts
+                ++ map SysTools.Option avxOpts
+                ++ map SysTools.Option avx512Opts
+                ++ map SysTools.Option stackAlignOpts)
 
     return (RealPhase next_phase, output_fn)
   where
@@ -1465,14 +1447,30 @@ runPhase (RealPhase LlvmLlc) input_fn dflags
 
         sseOpts | isSse4_2Enabled dflags = ["-mattr=+sse42"]
                 | isSse2Enabled dflags   = ["-mattr=+sse2"]
+                | isSseEnabled dflags    = ["-mattr=+sse"]
                 | otherwise              = []
+
+        avxOpts | isAvx512fEnabled dflags = ["-mattr=+avx512f"]
+                | isAvx2Enabled dflags    = ["-mattr=+avx2"]
+                | isAvxEnabled dflags     = ["-mattr=+avx"]
+                | otherwise               = []
+
+        avx512Opts =
+          [ "-mattr=+avx512cd" | isAvx512cdEnabled dflags ] ++
+          [ "-mattr=+avx512er" | isAvx512erEnabled dflags ] ++
+          [ "-mattr=+avx512pf" | isAvx512pfEnabled dflags ]
+
+        stackAlignOpts =
+            case platformArch (targetPlatform dflags) of
+              ArchX86_64 | isAvxEnabled dflags -> ["-stack-alignment=32"]
+              _                                -> []
 
 -----------------------------------------------------------------------------
 -- LlvmMangle phase
 
 runPhase (RealPhase LlvmMangle) input_fn dflags
   = do
-      let next_phase = if gopt Opt_SplitObjs dflags then Splitter else As
+      let next_phase = if gopt Opt_SplitObjs dflags then Splitter else As False
       output_fn <- phaseOutputFilename next_phase
       liftIO $ llvmFixupAsm dflags input_fn output_fn
       return (RealPhase next_phase, output_fn)
@@ -1484,6 +1482,7 @@ runPhase (RealPhase MergeStub) input_fn dflags
  = do
      PipeState{maybe_stub_o} <- getPipeState
      output_fn <- phaseOutputFilename StopLn
+     liftIO $ createDirectoryIfMissing True (takeDirectory output_fn)
      case maybe_stub_o of
        Nothing ->
          panic "runPhase(MergeStub): no stub"
@@ -1616,6 +1615,7 @@ mkExtraObjToLinkIntoBinary dflags = do
                 Nothing   -> empty
                 Just opts -> ptext (sLit "    __conf.rts_opts= ") <>
                                text (show opts) <> semi,
+             ptext (sLit "    __conf.rts_hs_main = rtsTrue;"),
              ptext (sLit "    return hs_main(argc, argv, &ZCMain_main_closure,__conf);"),
              char '}',
              char '\n' -- final newline, to keep gcc happy
@@ -1640,7 +1640,17 @@ mkNoteObjsToLinkIntoBinary dflags dep_packages = do
                                    text elfSectionNote,
                                    text "\n",
 
-          text "\t.ascii \"", info', text "\"\n" ]
+          text "\t.ascii \"", info', text "\"\n",
+
+          -- ALL generated assembly must have this section to disable
+          -- executable stacks.  See also
+          -- compiler/nativeGen/AsmCodeGen.lhs for another instance
+          -- where we need to do this.
+          (if platformHasGnuNonexecStack (targetPlatform dflags)
+           then text ".section .note.GNU-stack,\"\",@progbits\n"
+           else empty)
+
+           ]
           where
             info' = text $ escape info
 
@@ -1758,11 +1768,14 @@ getHCFilePackages filename =
 -- the packages.
 
 linkBinary :: DynFlags -> [FilePath] -> [PackageId] -> IO ()
-linkBinary dflags o_files dep_packages = do
+linkBinary = linkBinary' False
+
+linkBinary' :: Bool -> DynFlags -> [FilePath] -> [PackageId] -> IO ()
+linkBinary' staticLink dflags o_files dep_packages = do
     let platform = targetPlatform dflags
         mySettings = settings dflags
         verbFlags = getVerbFlags dflags
-        output_fn = exeFileName dflags
+        output_fn = exeFileName staticLink dflags
 
     -- get the full list of packages to link with, by combining the
     -- explicit packages with the auto packages and all of their
@@ -1795,6 +1808,15 @@ linkBinary dflags o_files dep_packages = do
                               then []
                               else ["-Wl,-rpath-link", "-Wl," ++ l]
               in ["-L" ++ l] ++ rpathlink ++ rpath
+         | osMachOTarget (platformOS platform) &&
+           dynLibLoader dflags == SystemDependent &&
+           not (gopt Opt_Static dflags) &&
+           gopt Opt_RPath dflags
+            = let libpath = if gopt Opt_RelativeDynlibPaths dflags
+                            then "@loader_path" </>
+                                 (l `makeRelativeTo` full_output_fn)
+                            else l
+              in ["-L" ++ l] ++ ["-Wl,-rpath", "-Wl," ++ libpath]
          | otherwise = ["-L" ++ l]
 
     let lib_paths = libraryPaths dflags
@@ -1803,13 +1825,24 @@ linkBinary dflags o_files dep_packages = do
     extraLinkObj <- mkExtraObjToLinkIntoBinary dflags
     noteLinkObjs <- mkNoteObjsToLinkIntoBinary dflags dep_packages
 
-    pkg_link_opts <- if platformBinariesAreStaticLibs platform
-                     then -- If building an executable really means
-                          -- making a static library (e.g. iOS), then
-                          -- we don't want the options (like -lm)
-                          -- that getPackageLinkOpts gives us. #7720
-                          return []
-                     else getPackageLinkOpts dflags dep_packages
+    pkg_link_opts <- do
+        (package_hs_libs, extra_libs, other_flags) <- getPackageLinkOpts dflags dep_packages
+        return $ if staticLink
+            then package_hs_libs -- If building an executable really means making a static
+                                 -- library (e.g. iOS), then we only keep the -l options for
+                                 -- HS packages, because libtool doesn't accept other options.
+                                 -- In the case of iOS these need to be added by hand to the
+                                 -- final link in Xcode.
+            else other_flags ++ package_hs_libs ++ extra_libs -- -Wl,-u,<sym> contained in other_flags
+                                                              -- needs to be put before -l<package>,
+                                                              -- otherwise Solaris linker fails linking
+                                                              -- a binary with unresolved symbols in RTS
+                                                              -- which are defined in base package
+                                                              -- the reason for this is a note in ld(1) about
+                                                              -- '-u' option: "The placement of this option
+                                                              -- on the command line is significant.
+                                                              -- This option must be placed before the library
+                                                              -- that defines the symbol."
 
     pkg_framework_path_opts <-
         if platformUsesFrameworks platform
@@ -1857,14 +1890,17 @@ linkBinary dflags o_files dep_packages = do
             let os = platformOS (targetPlatform dflags)
             in if os == OSOsf3 then ["-lpthread", "-lexc"]
                else if os `elem` [OSMinGW32, OSFreeBSD, OSOpenBSD,
-                                  OSNetBSD, OSHaiku, OSQNXNTO]
+                                  OSNetBSD, OSHaiku, OSQNXNTO, OSiOS, OSHaLVM]
                then []
                else ["-lpthread"]
          | otherwise               = []
 
     rc_objs <- maybeCreateManifest dflags output_fn
 
-    SysTools.runLink dflags (
+    let link = if staticLink
+                   then SysTools.runLibtool
+                   else SysTools.runLink
+    link dflags (
                        map SysTools.Option verbFlags
                       ++ [ SysTools.Option "-o"
                          , SysTools.FileOption "" output_fn
@@ -1887,9 +1923,21 @@ linkBinary dflags o_files dep_packages = do
                       --     ld: warning: could not create compact unwind for .LFB3: non-standard register 5 being saved in prolog
                       -- on x86.
                       ++ (if sLdSupportsCompactUnwind mySettings &&
-                             platformOS   platform == OSDarwin &&
-                             platformArch platform `elem` [ArchX86, ArchX86_64]
+                             not staticLink &&
+                             (platformOS platform == OSDarwin || platformOS platform == OSiOS) &&
+                             case platformArch platform of
+                               ArchX86 -> True
+                               ArchX86_64 -> True
+                               ArchARM {} -> True
+                               _ -> False
                           then ["-Wl,-no_compact_unwind"]
+                          else [])
+
+                      -- '-no_pie'
+                      -- iOS uses 'dynamic-no-pic', so we must pass this to ld to suppress a warning; see #7722
+                      ++ (if platformOS platform == OSiOS &&
+                             not staticLink
+                          then ["-Wl,-no_pie"]
                           else [])
 
                       -- '-Wl,-read_only_relocs,suppress'
@@ -1899,7 +1947,8 @@ linkBinary dflags o_files dep_packages = do
                       -- whether this is something we ought to fix, but
                       -- for now this flags silences them.
                       ++ (if platformOS   platform == OSDarwin &&
-                             platformArch platform == ArchX86
+                             platformArch platform == ArchX86 &&
+                             not staticLink
                           then ["-Wl,-read_only_relocs,suppress"]
                           else [])
 
@@ -1925,18 +1974,22 @@ linkBinary dflags o_files dep_packages = do
         throwGhcExceptionIO (InstallationError ("cannot move binary"))
 
 
-exeFileName :: DynFlags -> FilePath
-exeFileName dflags
+exeFileName :: Bool -> DynFlags -> FilePath
+exeFileName staticLink dflags
   | Just s <- outputFile dflags =
-      if platformOS (targetPlatform dflags) == OSMinGW32
-      then if null (takeExtension s)
-           then s <.> "exe"
-           else s
-      else s
+      case platformOS (targetPlatform dflags) of
+          OSMinGW32 -> s <?.> "exe"
+          _         -> if staticLink
+                         then s <?.> "a"
+                         else s
   | otherwise =
       if platformOS (targetPlatform dflags) == OSMinGW32
       then "main.exe"
-      else "a.out"
+      else if staticLink
+           then "liba.a"
+           else "a.out"
+ where s <?.> ext | null (takeExtension s) = s <.> ext
+                  | otherwise              = s
 
 maybeCreateManifest
    :: DynFlags
@@ -2001,6 +2054,13 @@ linkDynLibCheck dflags o_files dep_packages
 
     linkDynLib dflags o_files dep_packages
 
+linkStaticLibCheck :: DynFlags -> [String] -> [PackageId] -> IO ()
+linkStaticLibCheck dflags o_files dep_packages
+ = do
+    when (platformOS (targetPlatform dflags) `notElem` [OSiOS, OSDarwin]) $
+      throwGhcExceptionIO (ProgramError "Static archive creation only supported on Darwin/OS X/iOS")
+    linkBinary' True dflags o_files dep_packages
+
 -- -----------------------------------------------------------------------------
 -- Running CPP
 
@@ -2026,12 +2086,18 @@ doCpp dflags raw input_fn output_fn = do
         -- remember, in code we *compile*, the HOST is the same our TARGET,
         -- and BUILD is the same as our HOST.
 
-    let sse2 = isSse2Enabled dflags
-        sse4_2 = isSse4_2Enabled dflags
-        sse_defs =
-          [ "-D__SSE__=1" | sse2 || sse4_2 ] ++
-          [ "-D__SSE2__=1" | sse2 || sse4_2 ] ++
-          [ "-D__SSE4_2__=1" | sse4_2 ]
+    let sse_defs =
+          [ "-D__SSE__=1"    | isSseEnabled    dflags ] ++
+          [ "-D__SSE2__=1"   | isSse2Enabled   dflags ] ++
+          [ "-D__SSE4_2__=1" | isSse4_2Enabled dflags ]
+
+    let avx_defs =
+          [ "-D__AVX__=1"  | isAvxEnabled  dflags ] ++
+          [ "-D__AVX2__=1" | isAvx2Enabled dflags ] ++
+          [ "-D__AVX512CD__=1" | isAvx512cdEnabled dflags ] ++
+          [ "-D__AVX512ER__=1" | isAvx512erEnabled dflags ] ++
+          [ "-D__AVX512F__=1"  | isAvx512fEnabled  dflags ] ++
+          [ "-D__AVX512PF__=1" | isAvx512pfEnabled dflags ]
 
     backend_defs <- getBackendDefs dflags
 
@@ -2042,8 +2108,13 @@ doCpp dflags raw input_fn output_fn = do
                     ++ map SysTools.Option backend_defs
                     ++ map SysTools.Option hscpp_opts
                     ++ map SysTools.Option sse_defs
+                    ++ map SysTools.Option avx_defs
+        -- Set the language mode to assembler-with-cpp when preprocessing. This
+        -- alleviates some of the C99 macro rules relating to whitespace and the hash
+        -- operator, which we tend to abuse. Clang in particular is not very happy
+        -- about this.
                     ++ [ SysTools.Option     "-x"
-                       , SysTools.Option     "c"
+                       , SysTools.Option     "assembler-with-cpp"
                        , SysTools.Option     input_fn
         -- We hackily use Option instead of FileOption here, so that the file
         -- name is not back-slashed on Windows.  cpp is capable of
@@ -2060,7 +2131,9 @@ doCpp dflags raw input_fn output_fn = do
 getBackendDefs :: DynFlags -> IO [String]
 getBackendDefs dflags | hscTarget dflags == HscLlvm = do
     llvmVer <- figureLlvmVersion dflags
-    return [ "-D__GLASGOW_HASKELL_LLVM__="++show llvmVer ]
+    return $ case llvmVer of
+               Just n -> [ "-D__GLASGOW_HASKELL_LLVM__="++show n ]
+               _      -> []
 
 getBackendDefs _ =
     return []
@@ -2077,22 +2150,28 @@ joinObjectFiles :: DynFlags -> [FilePath] -> FilePath -> IO ()
 joinObjectFiles dflags o_files output_fn = do
   let mySettings = settings dflags
       ldIsGnuLd = sLdIsGnuLd mySettings
-      ld_r args = SysTools.runLink dflags ([
-                            SysTools.Option "-nostdlib",
-                            SysTools.Option "-nodefaultlibs",
-                            SysTools.Option "-Wl,-r"
-                            ]
-                            -- gcc on sparc sets -Wl,--relax implicitly, but
-                            -- -r and --relax are incompatible for ld, so
-                            -- disable --relax explicitly.
-                         ++ (if platformArch (targetPlatform dflags) == ArchSPARC
-                             && ldIsGnuLd
-                                then [SysTools.Option "-Wl,-no-relax"]
-                                else [])
-                         ++ map SysTools.Option ld_build_id
-                         ++ [ SysTools.Option "-o",
-                              SysTools.FileOption "" output_fn ]
-                         ++ args)
+      osInfo = platformOS (targetPlatform dflags)
+      ld_r args cc = SysTools.runLink dflags ([
+                       SysTools.Option "-nostdlib",
+                       SysTools.Option "-Wl,-r"
+                     ]
+                     ++ (if any (cc ==) [Clang, AppleClang, AppleClang51]
+                          then []
+                          else [SysTools.Option "-nodefaultlibs"])
+                     ++ (if osInfo == OSFreeBSD
+                          then [SysTools.Option "-L/usr/lib"]
+                          else [])
+                        -- gcc on sparc sets -Wl,--relax implicitly, but
+                        -- -r and --relax are incompatible for ld, so
+                        -- disable --relax explicitly.
+                     ++ (if platformArch (targetPlatform dflags) == ArchSPARC
+                         && ldIsGnuLd
+                            then [SysTools.Option "-Wl,-no-relax"]
+                            else [])
+                     ++ map SysTools.Option ld_build_id
+                     ++ [ SysTools.Option "-o",
+                          SysTools.FileOption "" output_fn ]
+                     ++ args)
 
       -- suppress the generation of the .note.gnu.build-id section,
       -- which we don't need and sometimes causes ld to emit a
@@ -2100,19 +2179,20 @@ joinObjectFiles dflags o_files output_fn = do
       ld_build_id | sLdSupportsBuildId mySettings = ["-Wl,--build-id=none"]
                   | otherwise                     = []
 
+  ccInfo <- getCompilerInfo dflags
   if ldIsGnuLd
      then do
           script <- newTempName dflags "ldscript"
           writeFile script $ "INPUT(" ++ unwords o_files ++ ")"
-          ld_r [SysTools.FileOption "" script]
+          ld_r [SysTools.FileOption "" script] ccInfo
      else if sLdSupportsFilelist mySettings
      then do
           filelist <- newTempName dflags "filelist"
           writeFile filelist $ unlines o_files
           ld_r [SysTools.Option "-Wl,-filelist",
-                SysTools.FileOption "-Wl," filelist]
+                SysTools.FileOption "-Wl," filelist] ccInfo
      else do
-          ld_r (map (SysTools.FileOption "") o_files)
+          ld_r (map (SysTools.FileOption "") o_files) ccInfo
 
 -- -----------------------------------------------------------------------------
 -- Misc.
@@ -2124,7 +2204,7 @@ hscPostBackendPhase dflags _ hsc_lang =
   case hsc_lang of
         HscC -> HCc
         HscAsm | gopt Opt_SplitObjs dflags -> Splitter
-               | otherwise                 -> As
+               | otherwise                 -> As False
         HscLlvm        -> LlvmOpt
         HscNothing     -> StopLn
         HscInterpreted -> StopLn
@@ -2139,3 +2219,38 @@ haveRtsOptsFlags dflags =
          isJust (rtsOpts dflags) || case rtsOptsEnabled dflags of
                                         RtsOptsSafeOnly -> False
                                         _ -> True
+
+-- Note [-fPIC for assembler]
+-- When compiling .c source file GHC's driver pipeline basically
+-- does the following two things:
+--   1. ${CC}              -S 'PIC_CFLAGS' source.c
+--   2. ${CC} -x assembler -c 'PIC_CFLAGS' source.S
+--
+-- Why do we need to pass 'PIC_CFLAGS' both to C compiler and assembler?
+-- Because on some architectures (at least sparc32) assembler also choses
+-- relocation type!
+-- Consider the following C module:
+--
+--     /* pic-sample.c */
+--     int v;
+--     void set_v (int n) { v = n; }
+--     int  get_v (void)  { return v; }
+--
+--     $ gcc -S -fPIC pic-sample.c
+--     $ gcc -c       pic-sample.s -o pic-sample.no-pic.o # incorrect binary
+--     $ gcc -c -fPIC pic-sample.s -o pic-sample.pic.o    # correct binary
+--
+--     $ objdump -r -d pic-sample.pic.o    > pic-sample.pic.o.od
+--     $ objdump -r -d pic-sample.no-pic.o > pic-sample.no-pic.o.od
+--     $ diff -u pic-sample.pic.o.od pic-sample.no-pic.o.od
+--
+-- Most of architectures won't show any difference in this test, but on sparc32
+-- the following assembly snippet:
+--
+--    sethi   %hi(_GLOBAL_OFFSET_TABLE_-8), %l7
+--
+-- generates two kinds or relocations, only 'R_SPARC_PC22' is correct:
+--
+--       3c:  2f 00 00 00     sethi  %hi(0), %l7
+--    -                       3c: R_SPARC_PC22        _GLOBAL_OFFSET_TABLE_-0x8
+--    +                       3c: R_SPARC_HI22        _GLOBAL_OFFSET_TABLE_-0x8

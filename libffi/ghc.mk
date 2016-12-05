@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Modifying
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -55,8 +55,11 @@ $(libffi_STAMP_CONFIGURE): $(TOUCH_DEP)
 	$(call removeFiles,$(libffi_STAMP_STATIC_SHARED_BUILD))
 	$(call removeFiles,$(libffi_STAMP_STATIC_SHARED_INSTALL))
 	$(call removeTrees,$(LIBFFI_DIR) libffi/build)
-	cat ghc-tarballs/libffi/libffi*.tar.gz | $(GZIP_CMD) -d | { cd libffi && $(TAR_CMD) -xf - ; }
+	cat libffi-tarballs/libffi*.tar.gz | $(GZIP_CMD) -d | { cd libffi && $(TAR_CMD) -xf - ; }
 	mv libffi/libffi-* libffi/build
+
+# We need to apply a patch to libffi that makes HaLVM a valid build target
+	patch -d libffi/build -p1 < libffi/HaLVM.patch
 
 # We have to fake a non-working ln for configure, so that the fallback
 # option (cp -p) gets used instead.  Otherwise the libffi build system
@@ -68,6 +71,13 @@ $(libffi_STAMP_CONFIGURE): $(TOUCH_DEP)
 	# colons break make
 	mv libffi/build/Makefile.in libffi/build/Makefile.in.orig
 	sed "s/-MD/-MMD/" < libffi/build/Makefile.in.orig > libffi/build/Makefile.in
+
+	# We attempt to specify the installation directory below with --libdir,
+	# but libffi installs into 'toolexeclibdir' instead, which may differ
+	# on systems where gcc has multilib support. Force libffi to use libdir.
+	# (https://sourceware.org/ml/libffi-discuss/2014/msg00016.html)
+	mv libffi/build/Makefile.in libffi/build/Makefile.in.orig
+	sed 's:@toolexeclibdir@:$$(libdir):g' < libffi/build/Makefile.in.orig > libffi/build/Makefile.in
 
 	# Their cmd invocation only works on msys. On cygwin it starts
 	# a cmd interactive shell. The replacement works in both environments.
@@ -86,14 +96,15 @@ $(libffi_STAMP_CONFIGURE): $(TOUCH_DEP)
 	    LD=$(LD) \
 	    AR=$(AR_STAGE1) \
 	    NM=$(NM) \
+	    RANLIB=$(REAL_RANLIB_CMD) \
         CFLAGS="$(SRC_CC_OPTS) $(CONF_CC_OPTS_STAGE1) -w" \
         LDFLAGS="$(SRC_LD_OPTS) $(CONF_GCC_LINKER_OPTS_STAGE1) -w" \
-        "$(SHELL)" configure \
+        "$(SHELL)" ./configure \
 	          --prefix=$(TOP)/libffi/build/inst \
 	          --libdir=$(TOP)/libffi/build/inst/lib \
 	          --enable-static=yes \
 	          --enable-shared=$(libffi_EnableShared) \
-	          --host=$(TargetPlatformFull)
+	          --target=$(TargetPlatformFull)
 
 	# wc on OS X has spaces in its output, which libffi's Makefile
 	# doesn't expect, so we tweak it to sed them out

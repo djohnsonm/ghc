@@ -313,6 +313,18 @@ wanteds = concat
           ,fieldOffset Both "StgRegTable" "rXMM4"
           ,fieldOffset Both "StgRegTable" "rXMM5"
           ,fieldOffset Both "StgRegTable" "rXMM6"
+          ,fieldOffset Both "StgRegTable" "rYMM1"
+          ,fieldOffset Both "StgRegTable" "rYMM2"
+          ,fieldOffset Both "StgRegTable" "rYMM3"
+          ,fieldOffset Both "StgRegTable" "rYMM4"
+          ,fieldOffset Both "StgRegTable" "rYMM5"
+          ,fieldOffset Both "StgRegTable" "rYMM6"
+          ,fieldOffset Both "StgRegTable" "rZMM1"
+          ,fieldOffset Both "StgRegTable" "rZMM2"
+          ,fieldOffset Both "StgRegTable" "rZMM3"
+          ,fieldOffset Both "StgRegTable" "rZMM4"
+          ,fieldOffset Both "StgRegTable" "rZMM5"
+          ,fieldOffset Both "StgRegTable" "rZMM6"
           ,fieldOffset Both "StgRegTable" "rL1"
           ,fieldOffset Both "StgRegTable" "rSp"
           ,fieldOffset Both "StgRegTable" "rSpLim"
@@ -346,6 +358,7 @@ wanteds = concat
 
           ,structSize C  "generation"
           ,structField C "generation" "n_new_large_words"
+          ,structField C "generation" "weak_ptr_list"
 
           ,structSize Both   "CostCentreStack"
           ,structField C     "CostCentreStack" "ccsID"
@@ -469,10 +482,14 @@ wanteds = concat
           ,closureField C "StgWeak" "key"
           ,closureField C "StgWeak" "value"
           ,closureField C "StgWeak" "finalizer"
-          ,closureField C "StgWeak" "cfinalizer"
+          ,closureField C "StgWeak" "cfinalizers"
 
-          ,closureSize  C "StgDeadWeak"
-          ,closureField C "StgDeadWeak" "link"
+          ,closureSize  C "StgCFinalizerList"
+          ,closureField C "StgCFinalizerList" "link"
+          ,closureField C "StgCFinalizerList" "fptr"
+          ,closureField C "StgCFinalizerList" "ptr"
+          ,closureField C "StgCFinalizerList" "eptr"
+          ,closureField C "StgCFinalizerList" "flag"
 
           ,closureSize  C "StgMVar"
           ,closureField C "StgMVar" "head"
@@ -521,13 +538,13 @@ wanteds = concat
           ,structSize   C "StgFunInfoExtraFwd"
           ,structField  C "StgFunInfoExtraFwd" "slow_apply"
           ,structField  C "StgFunInfoExtraFwd" "fun_type"
-          ,structField  C "StgFunInfoExtraFwd" "arity"
+          ,structFieldH Both "StgFunInfoExtraFwd" "arity"
           ,structField_ C "StgFunInfoExtraFwd_bitmap" "StgFunInfoExtraFwd" "b.bitmap"
 
           ,structSize   Both "StgFunInfoExtraRev"
           ,structField  C    "StgFunInfoExtraRev" "slow_apply_offset"
           ,structField  C    "StgFunInfoExtraRev" "fun_type"
-          ,structField  C    "StgFunInfoExtraRev" "arity"
+          ,structFieldH Both "StgFunInfoExtraRev" "arity"
           ,structField_ C    "StgFunInfoExtraRev_bitmap" "StgFunInfoExtraRev" "b.bitmap"
 
           ,structField C "StgLargeBitmap" "size"
@@ -571,11 +588,11 @@ wanteds = concat
           ,constantWord Haskell "MAX_Float_REG"        "MAX_FLOAT_REG"
           ,constantWord Haskell "MAX_Double_REG"       "MAX_DOUBLE_REG"
           ,constantWord Haskell "MAX_Long_REG"         "MAX_LONG_REG"
-          ,constantWord Haskell "MAX_SSE_REG"          "MAX_SSE_REG"
+          ,constantWord Haskell "MAX_XMM_REG"          "MAX_XMM_REG"
           ,constantWord Haskell "MAX_Real_Vanilla_REG" "MAX_REAL_VANILLA_REG"
           ,constantWord Haskell "MAX_Real_Float_REG"   "MAX_REAL_FLOAT_REG"
           ,constantWord Haskell "MAX_Real_Double_REG"  "MAX_REAL_DOUBLE_REG"
-          ,constantWord Haskell "MAX_Real_SSE_REG"     "MAX_REAL_SSE_REG"
+          ,constantWord Haskell "MAX_Real_XMM_REG"     "MAX_REAL_XMM_REG"
           ,constantWord Haskell "MAX_Real_Long_REG"    "MAX_REAL_LONG_REG"
 
           -- This tells the native code generator the size of the spill
@@ -621,7 +638,7 @@ getWanted verbose tmpdir gccProgram gccFlags nmProgram
              oFile = tmpdir </> "tmp.o"
          writeFile cFile cStuff
          execute verbose gccProgram (gccFlags ++ ["-c", cFile, "-o", oFile])
-         xs <- readProcess nmProgram [oFile] ""
+         xs <- readProcess nmProgram ["-P", oFile] ""
          let ls = lines xs
              ms = map parseNmLine ls
              m = Map.fromList $ catMaybes ms
@@ -690,28 +707,21 @@ getWanted verbose tmpdir gccProgram gccFlags nmProgram
           doWanted (ClosurePayloadMacro {}) = []
           doWanted (FieldTypeGcptrMacro {}) = []
 
-          -- parseNmLine parses nm output that looks like
-          -- "0000000b C derivedConstantMAX_Vanilla_REG"
+          -- parseNmLine parses "nm -P" output that looks like
+          -- "derivedConstantMAX_Vanilla_REG C 0000000b 0000000b" (GNU nm)
+          -- "_derivedConstantMAX_Vanilla_REG C b 0" (Mac OS X)
+          -- "_derivedConstantMAX_Vanilla_REG C 000000b" (MinGW)
+          -- "derivedConstantMAX_Vanilla_REG D        1        b" (Solaris)
           -- and returns ("MAX_Vanilla_REG", 11)
-          parseNmLine xs0 = case break (' ' ==) xs0 of
-                            (x1, ' ' : xs1) ->
-                                case break (' ' ==) xs1 of
-                                (x2, ' ' : x3) ->
-                                    case readHex x1 of
-                                    [(size, "")] ->
-                                        case x2 of
-                                        "C" ->
-                                            let x3' = case x3 of
-                                                      '_' : rest -> rest
-                                                      _          -> x3
-                                            in case stripPrefix prefix x3' of
-                                               Just name ->
-                                                   Just (name, size)
-                                               _ -> Nothing
-                                        _ -> Nothing
-                                    _ -> Nothing
-                                _ -> Nothing
-                            _ -> Nothing
+          parseNmLine line
+              = case words line of
+                ('_' : n) : "C" : s : _ -> mkP n s
+                n : "C" : s : _ -> mkP n s
+                [n, "D", _, s] -> mkP n s
+                _ -> Nothing
+              where mkP r s = case (stripPrefix prefix r, readHex s) of
+                        (Just name, [(size, "")]) -> Just (name, size)
+                        _ -> Nothing
 
           -- If an Int value is larger than 2^28 or smaller
           -- than -2^28, then fail.

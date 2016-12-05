@@ -1,4 +1,4 @@
-%
+    %
 % (c) The University of Glasgow 2006
 % (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 %
@@ -30,8 +30,11 @@ module TcGenDeriv (
         deepSubtypesContaining, foldDataConArgs,
         gen_Foldable_binds,
         gen_Traversable_binds,
+        mkCoerceClassMethEqn,
+        gen_Newtype_binds,
         genAuxBinds,
-        ordOpTbl, boxConTbl
+        ordOpTbl, boxConTbl,
+        mkRdrFunBind
     ) where
 
 #include "HsVersions.h"
@@ -48,22 +51,26 @@ import PrelInfo
 import FamInstEnv( FamInst )
 import MkCore ( eRROR_ID )
 import PrelNames hiding (error_RDR)
+import MkId ( coerceId )
 import PrimOp
 import SrcLoc
 import TyCon
-import CoAxiom
 import TcType
 import TysPrim
 import TysWiredIn
 import Type
+import Class
 import TypeRep
 import VarSet
+import VarEnv
 import Module
 import State
 import Util
+import Var
 import MonadUtils
 import Outputable
 import FastString
+import Pair
 import Bag
 import Fingerprint
 import TcEnv (InstInfo)
@@ -87,7 +94,7 @@ data DerivStuff     -- Please add this auxiliary stuff
 
   -- Generics
   | DerivTyCon TyCon                   -- New data types
-  | DerivFamInst (FamInst Unbranched)  -- New type family instances
+  | DerivFamInst (FamInst)             -- New type family instances
 
   -- New top-level auxiliary bindings
   | DerivHsBind (LHsBind RdrName, LSig RdrName) -- Also used for SYB
@@ -182,7 +189,7 @@ gen_Eq_binds loc tycon
                   -- extract tags compare for equality
       = [([a_Pat, b_Pat],
          untag_Expr tycon [(a_RDR,ah_RDR), (b_RDR,bh_RDR)]
-                    (genOpApp (nlHsVar ah_RDR) eqInt_RDR (nlHsVar bh_RDR)))]
+                    (genPrimOpApp (nlHsVar ah_RDR) eqInt_RDR (nlHsVar bh_RDR)))]
 
     aux_binds | no_tag_match_cons = emptyBag
               | otherwise         = unitBag $ DerivAuxBind $ DerivCon2Tag tycon
@@ -404,14 +411,14 @@ gen_Ord_binds loc tycon
 
       | tag > last_tag `div` 2  -- lower range is larger
       = untag_Expr tycon [(b_RDR, bh_RDR)] $
-        nlHsIf (genOpApp (nlHsVar bh_RDR) ltInt_RDR tag_lit)
+        nlHsIf (genPrimOpApp (nlHsVar bh_RDR) ltInt_RDR tag_lit)
                (gtResult op) $  -- Definitely GT
         nlHsCase (nlHsVar b_RDR) [ mkInnerEqAlt op data_con
                                  , mkSimpleHsAlt nlWildPat (ltResult op) ]
 
       | otherwise               -- upper range is larger
       = untag_Expr tycon [(b_RDR, bh_RDR)] $
-        nlHsIf (genOpApp (nlHsVar bh_RDR) gtInt_RDR tag_lit)
+        nlHsIf (genPrimOpApp (nlHsVar bh_RDR) gtInt_RDR tag_lit)
                (ltResult op) $  -- Definitely LT
         nlHsCase (nlHsVar b_RDR) [ mkInnerEqAlt op data_con
                                  , mkSimpleHsAlt nlWildPat (gtResult op) ]
@@ -478,21 +485,21 @@ unliftedOrdOp tycon ty op a b
        OrdGT      -> wrap gt_op
   where
    (lt_op, le_op, eq_op, ge_op, gt_op) = primOrdOps "Ord" tycon ty
-   wrap prim_op = genOpApp a_expr (primOpRdrName prim_op) b_expr
+   wrap prim_op = genPrimOpApp a_expr prim_op b_expr
    a_expr = nlHsVar a
    b_expr = nlHsVar b
 
-unliftedCompare :: PrimOp -> PrimOp
+unliftedCompare :: RdrName -> RdrName
                 -> LHsExpr RdrName -> LHsExpr RdrName   -- What to cmpare
                 -> LHsExpr RdrName -> LHsExpr RdrName -> LHsExpr RdrName  -- Three results
                 -> LHsExpr RdrName
 -- Return (if a < b then lt else if a == b then eq else gt)
 unliftedCompare lt_op eq_op a_expr b_expr lt eq gt
-  = nlHsIf (genOpApp a_expr (primOpRdrName lt_op) b_expr) lt $
+  = nlHsIf (genPrimOpApp a_expr lt_op b_expr) lt $
                         -- Test (<) first, not (==), because the latter
                         -- is true less often, so putting it first would
                         -- mean more tests (dynamically)
-        nlHsIf (genOpApp a_expr (primOpRdrName eq_op) b_expr) eq gt
+        nlHsIf (genPrimOpApp a_expr eq_op b_expr) eq gt
 
 nlConWildPat :: DataCon -> LPat RdrName
 -- The pattern (K {})
@@ -755,8 +762,8 @@ gen_Ix_binds loc tycon
           untag_Expr tycon [(a_RDR, ah_RDR)] (
           untag_Expr tycon [(b_RDR, bh_RDR)] (
           untag_Expr tycon [(c_RDR, ch_RDR)] (
-          nlHsIf (genOpApp (nlHsVar ch_RDR) geInt_RDR (nlHsVar ah_RDR)) (
-             (genOpApp (nlHsVar ch_RDR) leInt_RDR (nlHsVar bh_RDR))
+          nlHsIf (genPrimOpApp (nlHsVar ch_RDR) geInt_RDR (nlHsVar ah_RDR)) (
+             (genPrimOpApp (nlHsVar ch_RDR) leInt_RDR (nlHsVar bh_RDR))
           ) {-else-} (
              false_Expr
           ))))
@@ -873,7 +880,7 @@ instance Read T where
 
 Note [Use expectP]
 ~~~~~~~~~~~~~~~~~~
-Note that we use 
+Note that we use
    expectP (Ident "T1")
 rather than
    Ident "T1" <- lexP
@@ -889,7 +896,7 @@ What should we get for this?  (Trac #7931)
 
 Here we want
   read "[]" :: [Emp]   to succeed, returning []
-So we do NOT want 
+So we do NOT want
    instance Read Emp where
      readPrec = error "urk"
 Rather we want
@@ -897,7 +904,7 @@ Rather we want
      readPred = pfail   -- Same as choose []
 
 Because 'pfail' allows the parser to backtrack, but 'error' doesn't.
-These instances are also useful for Read (Either Int Emp), where 
+These instances are also useful for Read (Either Int Emp), where
 we want to be able to parse (Left 3) just fine.
 
 \begin{code}
@@ -1428,8 +1435,8 @@ gen_Data_binds dflags loc tycon
 
         ------------ gcast1/2
     tycon_kind = tyConKind tycon
-    gcast_binds | tycon_kind `eqKind` kind1 = mk_gcast dataCast1_RDR gcast1_RDR
-                | tycon_kind `eqKind` kind2 = mk_gcast dataCast2_RDR gcast2_RDR
+    gcast_binds | tycon_kind `tcEqKind` kind1 = mk_gcast dataCast1_RDR gcast1_RDR
+                | tycon_kind `tcEqKind` kind2 = mk_gcast dataCast2_RDR gcast2_RDR
                 | otherwise                 = emptyBag
     mk_gcast dataCast_RDR gcast_RDR
       = unitBag (mk_easy_FunBind loc dataCast_RDR [nlVarPat f_RDR]
@@ -1443,7 +1450,13 @@ kind2 = liftedTypeKind `mkArrowKind` kind1
 gfoldl_RDR, gunfold_RDR, toConstr_RDR, dataTypeOf_RDR, mkConstr_RDR,
     mkDataType_RDR, conIndex_RDR, prefix_RDR, infix_RDR,
     dataCast1_RDR, dataCast2_RDR, gcast1_RDR, gcast2_RDR,
-    constr_RDR, dataType_RDR :: RdrName
+    constr_RDR, dataType_RDR,
+    eqChar_RDR  , ltChar_RDR  , geChar_RDR  , gtChar_RDR  , leChar_RDR  ,
+    eqInt_RDR   , ltInt_RDR   , geInt_RDR   , gtInt_RDR   , leInt_RDR   ,
+    eqWord_RDR  , ltWord_RDR  , geWord_RDR  , gtWord_RDR  , leWord_RDR  ,
+    eqAddr_RDR  , ltAddr_RDR  , geAddr_RDR  , gtAddr_RDR  , leAddr_RDR  ,
+    eqFloat_RDR , ltFloat_RDR , geFloat_RDR , gtFloat_RDR , leFloat_RDR ,
+    eqDouble_RDR, ltDouble_RDR, geDouble_RDR, gtDouble_RDR, leDouble_RDR :: RdrName
 gfoldl_RDR     = varQual_RDR  gENERICS (fsLit "gfoldl")
 gunfold_RDR    = varQual_RDR  gENERICS (fsLit "gunfold")
 toConstr_RDR   = varQual_RDR  gENERICS (fsLit "toConstr")
@@ -1459,6 +1472,42 @@ dataType_RDR   = tcQual_RDR   gENERICS (fsLit "DataType")
 conIndex_RDR   = varQual_RDR  gENERICS (fsLit "constrIndex")
 prefix_RDR     = dataQual_RDR gENERICS (fsLit "Prefix")
 infix_RDR      = dataQual_RDR gENERICS (fsLit "Infix")
+
+eqChar_RDR     = varQual_RDR  gHC_PRIM (fsLit "eqChar#")
+ltChar_RDR     = varQual_RDR  gHC_PRIM (fsLit "ltChar#")
+leChar_RDR     = varQual_RDR  gHC_PRIM (fsLit "leChar#")
+gtChar_RDR     = varQual_RDR  gHC_PRIM (fsLit "gtChar#")
+geChar_RDR     = varQual_RDR  gHC_PRIM (fsLit "geChar#")
+
+eqInt_RDR      = varQual_RDR  gHC_PRIM (fsLit "==#")
+ltInt_RDR      = varQual_RDR  gHC_PRIM (fsLit "<#" )
+leInt_RDR      = varQual_RDR  gHC_PRIM (fsLit "<=#")
+gtInt_RDR      = varQual_RDR  gHC_PRIM (fsLit ">#" )
+geInt_RDR      = varQual_RDR  gHC_PRIM (fsLit ">=#")
+
+eqWord_RDR     = varQual_RDR  gHC_PRIM (fsLit "eqWord#")
+ltWord_RDR     = varQual_RDR  gHC_PRIM (fsLit "ltWord#")
+leWord_RDR     = varQual_RDR  gHC_PRIM (fsLit "leWord#")
+gtWord_RDR     = varQual_RDR  gHC_PRIM (fsLit "gtWord#")
+geWord_RDR     = varQual_RDR  gHC_PRIM (fsLit "geWord#")
+
+eqAddr_RDR     = varQual_RDR  gHC_PRIM (fsLit "eqAddr#")
+ltAddr_RDR     = varQual_RDR  gHC_PRIM (fsLit "ltAddr#")
+leAddr_RDR     = varQual_RDR  gHC_PRIM (fsLit "leAddr#")
+gtAddr_RDR     = varQual_RDR  gHC_PRIM (fsLit "gtAddr#")
+geAddr_RDR     = varQual_RDR  gHC_PRIM (fsLit "geAddr#")
+
+eqFloat_RDR    = varQual_RDR  gHC_PRIM (fsLit "eqFloat#")
+ltFloat_RDR    = varQual_RDR  gHC_PRIM (fsLit "ltFloat#")
+leFloat_RDR    = varQual_RDR  gHC_PRIM (fsLit "leFloat#")
+gtFloat_RDR    = varQual_RDR  gHC_PRIM (fsLit "gtFloat#")
+geFloat_RDR    = varQual_RDR  gHC_PRIM (fsLit "geFloat#")
+
+eqDouble_RDR   = varQual_RDR  gHC_PRIM (fsLit "==##")
+ltDouble_RDR   = varQual_RDR  gHC_PRIM (fsLit "<##" )
+leDouble_RDR   = varQual_RDR  gHC_PRIM (fsLit "<=##")
+gtDouble_RDR   = varQual_RDR  gHC_PRIM (fsLit ">##" )
+geDouble_RDR   = varQual_RDR  gHC_PRIM (fsLit ">=##")
 \end{code}
 
 
@@ -1554,7 +1603,7 @@ gen_Functor_binds loc tycon
   = (unitBag fmap_bind, emptyBag)
   where
     data_cons = tyConDataCons tycon
-    fmap_bind = L loc $ mkRdrFunBind (L loc fmap_RDR) eqns
+    fmap_bind = mkRdrFunBind (L loc fmap_RDR) eqns
 
     fmap_eqn con = evalState (match_for_con [f_Pat] con =<< parts) bs_RDRs
       where
@@ -1570,7 +1619,7 @@ gen_Functor_binds loc tycon
                  , ft_fun  = \g h -> do                      -- fmap f = \x b -> h (x (g b))
                                  gg <- g
                                  hh <- h
-                                 mkSimpleLam2 $ \x b -> return $ nlHsApp hh (nlHsApp x (nlHsApp gg b)) 
+                                 mkSimpleLam2 $ \x b -> return $ nlHsApp hh (nlHsApp x (nlHsApp gg b))
                  , ft_tup = \t gs -> do                      -- fmap f = \x -> case x of (a1,a2,..) -> (g1 a1,g2 a2,..)
                                  gg <- sequence gs
                                  mkSimpleLam $ mkSimpleTupleCase match_for_con t gg
@@ -1743,13 +1792,13 @@ gen_Foldable_binds loc tycon
   where
     data_cons = tyConDataCons tycon
 
-    foldr_bind = L loc $ mkRdrFunBind (L loc foldable_foldr_RDR) eqns
+    foldr_bind = mkRdrFunBind (L loc foldable_foldr_RDR) eqns
     eqns = map foldr_eqn data_cons
     foldr_eqn con = evalState (match_foldr z_Expr [f_Pat,z_Pat] con =<< parts) bs_RDRs
       where
         parts = sequence $ foldDataConArgs ft_foldr con
 
-    foldMap_bind = L loc $ mkRdrFunBind (L loc foldMap_RDR) (map foldMap_eqn data_cons)
+    foldMap_bind = mkRdrFunBind (L loc foldMap_RDR) (map foldMap_eqn data_cons)
     foldMap_eqn con = evalState (match_foldMap [f_Pat] con =<< parts) bs_RDRs
       where
         parts = sequence $ foldDataConArgs ft_foldMap con
@@ -1778,7 +1827,7 @@ gen_Foldable_binds loc tycon
                     , ft_co_var = panic "contravariant"
                     , ft_fun = panic "function"
                     , ft_bad_app = panic "in other argument" }
-    
+
     match_foldMap = mkSimpleConMatch $ \_con_name xs -> return $
         case xs of
             [] -> mempty_Expr
@@ -1818,7 +1867,7 @@ gen_Traversable_binds loc tycon
   where
     data_cons = tyConDataCons tycon
 
-    traverse_bind = L loc $ mkRdrFunBind (L loc traverse_RDR) eqns
+    traverse_bind = mkRdrFunBind (L loc traverse_RDR) eqns
     eqns = map traverse_eqn data_cons
     traverse_eqn con = evalState (match_for_con [f_Pat] con =<< parts) bs_RDRs
       where
@@ -1847,7 +1896,69 @@ gen_Traversable_binds loc tycon
        where appAp x y = nlHsApps ap_RDR [x,y]
 \end{code}
 
+%************************************************************************
+%*                                                                      *
+                     Newtype-deriving instances
+%*                                                                      *
+%************************************************************************
 
+We take every method in the original instance and `coerce` it to fit
+into the derived instance. We need a type annotation on the argument
+to `coerce` to make it obvious what instantiation of the method we're
+coercing from.
+
+See #8503 for more discussion.
+
+\begin{code}
+mkCoerceClassMethEqn :: Class   -- the class being derived
+                     -> [TyVar] -- the tvs in the instance head
+                     -> [Type]  -- instance head parameters (incl. newtype)
+                     -> Type    -- the representation type (already eta-reduced)
+                     -> Id      -- the method to look at
+                     -> Pair Type
+mkCoerceClassMethEqn cls inst_tvs cls_tys rhs_ty id
+  = Pair (substTy rhs_subst user_meth_ty) (substTy lhs_subst user_meth_ty)
+  where
+    cls_tvs = classTyVars cls
+    in_scope = mkInScopeSet $ mkVarSet inst_tvs
+    lhs_subst = mkTvSubst in_scope (zipTyEnv cls_tvs cls_tys)
+    rhs_subst = mkTvSubst in_scope (zipTyEnv cls_tvs (changeLast cls_tys rhs_ty))
+    (_class_tvs, _class_constraint, user_meth_ty) = tcSplitSigmaTy (varType id)
+
+    changeLast :: [a] -> a -> [a]
+    changeLast []     _  = panic "changeLast"
+    changeLast [_]    x  = [x]
+    changeLast (x:xs) x' = x : changeLast xs x'
+
+
+gen_Newtype_binds :: SrcSpan
+                  -> Class   -- the class being derived
+                  -> [TyVar] -- the tvs in the instance head
+                  -> [Type]  -- instance head parameters (incl. newtype)
+                  -> Type    -- the representation type (already eta-reduced)
+                  -> LHsBinds RdrName
+gen_Newtype_binds loc cls inst_tvs cls_tys rhs_ty
+  = listToBag $ zipWith mk_bind
+        (classMethods cls)
+        (map (mkCoerceClassMethEqn cls inst_tvs cls_tys rhs_ty) (classMethods cls))
+  where
+    coerce_RDR = getRdrName coerceId
+    mk_bind :: Id -> Pair Type -> LHsBind RdrName
+    mk_bind id (Pair tau_ty user_ty)
+      = mkRdrFunBind (L loc meth_RDR) [mkSimpleMatch [] rhs_expr]
+      where
+        meth_RDR = getRdrName id
+        rhs_expr
+          = ( nlHsVar coerce_RDR
+                `nlHsApp`
+              (nlHsVar meth_RDR `nlExprWithTySig` toHsType tau_ty'))
+            `nlExprWithTySig` toHsType user_ty
+        -- Open the representation type here, so that it's forall'ed type
+        -- variables refer to the ones bound in the user_ty
+        (_, _, tau_ty')  = tcSplitSigmaTy tau_ty
+
+    nlExprWithTySig e s = noLoc (ExprWithTySig e s)
+\end{code}
 
 %************************************************************************
 %*                                                                      *
@@ -1916,7 +2027,7 @@ type SeparateBagsDerivStuff = -- AuxBinds and SYB bindings
                               ( Bag (LHsBind RdrName, LSig RdrName)
                                 -- Extra bindings (used by Generic only)
                               , Bag TyCon   -- Extra top-level datatypes
-                              , Bag (FamInst Unbranched) -- Extra family instances
+                              , Bag (FamInst)           -- Extra family instances
                               , Bag (InstInfo RdrName)) -- Extra instances
 
 genAuxBinds :: SrcSpan -> BagDerivStuff -> SeparateBagsDerivStuff
@@ -1970,20 +2081,21 @@ mk_FunBind :: SrcSpan -> RdrName
            -> [([LPat RdrName], LHsExpr RdrName)]
            -> LHsBind RdrName
 mk_FunBind loc fun pats_and_exprs
-  = L loc $ mkRdrFunBind (L loc fun) matches
+  = mkRdrFunBind (L loc fun) matches
   where
     matches = [mkMatch p e emptyLocalBinds | (p,e) <-pats_and_exprs]
 
-mkRdrFunBind :: Located RdrName -> [LMatch RdrName (LHsExpr RdrName)] -> HsBind RdrName
-mkRdrFunBind fun@(L _ fun_rdr) matches
- | null matches = mkFunBind fun [mkMatch [] (error_Expr str) emptyLocalBinds]
-        -- Catch-all eqn looks like
-        --     fmap = error "Void fmap"
-        -- It's needed if there no data cons at all,
-        -- which can happen with -XEmptyDataDecls
-        -- See Trac #4302
- | otherwise    = mkFunBind fun matches
+mkRdrFunBind :: Located RdrName -> [LMatch RdrName (LHsExpr RdrName)] -> LHsBind RdrName
+mkRdrFunBind fun@(L loc fun_rdr) matches = L loc (mkFunBind fun matches')
  where
+   -- Catch-all eqn looks like
+   --     fmap = error "Void fmap"
+   -- It's needed if there no data cons at all,
+   -- which can happen with -XEmptyDataDecls
+   -- See Trac #4302
+   matches' = if null matches
+              then [mkMatch [] (error_Expr str) emptyLocalBinds]
+              else matches
    str = "Void " ++ occNameString (rdrNameOcc fun_rdr)
 \end{code}
 
@@ -2004,26 +2116,26 @@ box_if_necy cls_str tycon arg arg_ty
 primOrdOps :: String    -- The class involved
            -> TyCon     -- The tycon involved
            -> Type      -- The type
-           -> (PrimOp, PrimOp, PrimOp, PrimOp, PrimOp)  -- (lt,le,eq,ge,gt)
+           -> (RdrName, RdrName, RdrName, RdrName, RdrName)  -- (lt,le,eq,ge,gt)
 -- See Note [Deriving and unboxed types]
 primOrdOps str tycon ty = assoc_ty_id str tycon ordOpTbl ty
 
-ordOpTbl :: [(Type, (PrimOp, PrimOp, PrimOp, PrimOp, PrimOp))]
+ordOpTbl :: [(Type, (RdrName, RdrName, RdrName, RdrName, RdrName))]
 ordOpTbl
- =  [(charPrimTy,       (CharLtOp,   CharLeOp,   CharEqOp,   CharGeOp,   CharGtOp))
-    ,(intPrimTy,        (IntLtOp,    IntLeOp,    IntEqOp,    IntGeOp,    IntGtOp))
-    ,(wordPrimTy,       (WordLtOp,   WordLeOp,   WordEqOp,   WordGeOp,   WordGtOp))
-    ,(addrPrimTy,       (AddrLtOp,   AddrLeOp,   AddrEqOp,   AddrGeOp,   AddrGtOp))
-    ,(floatPrimTy,      (FloatLtOp,  FloatLeOp,  FloatEqOp,  FloatGeOp,  FloatGtOp))
-    ,(doublePrimTy,     (DoubleLtOp, DoubleLeOp, DoubleEqOp, DoubleGeOp, DoubleGtOp)) ]
+ =  [(charPrimTy  , (ltChar_RDR  , leChar_RDR  , eqChar_RDR  , geChar_RDR  , gtChar_RDR  ))
+    ,(intPrimTy   , (ltInt_RDR   , leInt_RDR   , eqInt_RDR   , geInt_RDR   , gtInt_RDR   ))
+    ,(wordPrimTy  , (ltWord_RDR  , leWord_RDR  , eqWord_RDR  , geWord_RDR  , gtWord_RDR  ))
+    ,(addrPrimTy  , (ltAddr_RDR  , leAddr_RDR  , eqAddr_RDR  , geAddr_RDR  , gtAddr_RDR  ))
+    ,(floatPrimTy , (ltFloat_RDR , leFloat_RDR , eqFloat_RDR , geFloat_RDR , gtFloat_RDR ))
+    ,(doublePrimTy, (ltDouble_RDR, leDouble_RDR, eqDouble_RDR, geDouble_RDR, gtDouble_RDR)) ]
 
 boxConTbl :: [(Type, RdrName)]
 boxConTbl
-  = [(charPrimTy,       getRdrName charDataCon)
-    ,(intPrimTy,        getRdrName intDataCon)
-    ,(wordPrimTy,       wordDataCon_RDR)
-    ,(floatPrimTy,      getRdrName floatDataCon)
-    ,(doublePrimTy,     getRdrName doubleDataCon)
+  = [(charPrimTy  , getRdrName charDataCon  )
+    ,(intPrimTy   , getRdrName intDataCon   )
+    ,(wordPrimTy  , getRdrName wordDataCon  )
+    ,(floatPrimTy , getRdrName floatDataCon )
+    ,(doublePrimTy, getRdrName doubleDataCon)
     ]
 
 assoc_ty_id :: String           -- The class involved
@@ -2046,10 +2158,10 @@ and_Expr a b = genOpApp a and_RDR    b
 -----------------------------------------------------------------------
 
 eq_Expr :: TyCon -> Type -> LHsExpr RdrName -> LHsExpr RdrName -> LHsExpr RdrName
-eq_Expr tycon ty a b = genOpApp a eq_op b
+eq_Expr tycon ty a b
+    | not (isUnLiftedType ty) = genOpApp a eq_RDR b
+    | otherwise               = genPrimOpApp a prim_eq b
  where
-   eq_op | not (isUnLiftedType ty) = eq_RDR
-         | otherwise               = primOpRdrName prim_eq
    (_, _, prim_eq, _, _) = primOrdOps "Eq" tycon ty
 \end{code}
 
@@ -2122,6 +2234,9 @@ parenify e                 = mkHsPar e
 -- renamer won't subsequently try to re-associate it.
 genOpApp :: LHsExpr RdrName -> RdrName -> LHsExpr RdrName -> LHsExpr RdrName
 genOpApp e1 op e2 = nlHsPar (nlHsOpApp e1 op e2)
+
+genPrimOpApp :: LHsExpr RdrName -> RdrName -> LHsExpr RdrName -> LHsExpr RdrName
+genPrimOpApp e1 op e2 = nlHsPar (nlHsApp (nlHsVar tagToEnum_RDR) (nlHsOpApp e1 op e2))
 \end{code}
 
 \begin{code}
@@ -2185,25 +2300,9 @@ mkAuxBinderName parent occ_fun = mkRdrUnqual (occ_fun (nameOccName parent))
 -- Was: mkDerivedRdrName name occ_fun, which made an original name
 -- But:  (a) that does not work well for standalone-deriving
 --       (b) an unqualified name is just fine, provided it can't clash with user code
-\end{code}
 
-s RdrName for PrimOps.  Can't be done in PrelNames, because PrimOp imports
-PrelNames, so PrelNames can't import PrimOp.
-
-\begin{code}
-primOpRdrName :: PrimOp -> RdrName
-primOpRdrName op = getRdrName (primOpId op)
-
-minusInt_RDR, eqInt_RDR, ltInt_RDR, geInt_RDR, gtInt_RDR, leInt_RDR,
-    tagToEnum_RDR :: RdrName
-minusInt_RDR  = primOpRdrName IntSubOp
-eqInt_RDR     = primOpRdrName IntEqOp
-ltInt_RDR     = primOpRdrName IntLtOp
-geInt_RDR     = primOpRdrName IntGeOp
-gtInt_RDR     = primOpRdrName IntGtOp
-leInt_RDR     = primOpRdrName IntLeOp
-tagToEnum_RDR = primOpRdrName TagToEnumOp
-
-error_RDR :: RdrName
-error_RDR = getRdrName eRROR_ID
+minusInt_RDR, tagToEnum_RDR, error_RDR :: RdrName
+minusInt_RDR  = getRdrName (primOpId IntSubOp   )
+tagToEnum_RDR = getRdrName (primOpId TagToEnumOp)
+error_RDR     = getRdrName eRROR_ID
 \end{code}

@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Modifying
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -33,6 +33,8 @@ ALL_DIRS = hooks sm eventlog
 
 ifeq "$(HostOS_CPP)" "mingw32"
 ALL_DIRS += win32
+else ifeq "$(TargetOS_CPP)" "HaLVM"
+ALL_DIRS += xen minlibc
 else
 ALL_DIRS += posix
 endif
@@ -71,7 +73,7 @@ endif
 # collect the -l and -L flags that we need to link the rts dyn lib.
 # Note that, as sed on OS X doesn't handle \+, we use [^ ][^ ]* rather
 # than [^ ]\+
-rts/libs.depend : $$(ghc-pkg_INPLACE)
+rts/dist/libs.depend : $$(ghc-pkg_INPLACE) | $$(dir $$@)/.
 	"$(ghc-pkg_INPLACE)" --simple-output field rts extra-libraries \
 	  | sed -e 's/\([^ ][^ ]*\)/-l\1/g' > $@
 	"$(ghc-pkg_INPLACE)" --simple-output field rts library-dirs \
@@ -116,6 +118,9 @@ else
 # depend on libffi.so, but copy libffi.so*
 rts/dist/build/lib$(LIBFFI_NAME)$(soext): libffi/build/inst/lib/lib$(LIBFFI_NAME)$(soext)
 	cp libffi/build/inst/lib/lib$(LIBFFI_NAME)$(soext)* rts/dist/build
+ifeq "$(TargetOS_CPP)" "darwin"
+	install_name_tool -id @rpath/lib$(LIBFFI_NAME)$(soext) rts/dist/build/lib$(LIBFFI_NAME)$(soext)
+endif
 endif
 endif
 endif
@@ -139,6 +144,7 @@ ifneq "$$(findstring dyn, $1)" ""
 ifeq "$$(HostOS_CPP)" "mingw32" 
 rts_dist_$1_CC_OPTS += -DCOMPILING_WINDOWS_DLL
 endif
+rts_dist_$1_CC_OPTS += -DDYNAMIC
 endif
 
 ifneq "$$(findstring thr, $1)" ""
@@ -182,26 +188,32 @@ endif
 # Making a shared library for the RTS.
 ifneq "$$(findstring dyn, $1)" ""
 ifeq "$$(HostOS_CPP)" "mingw32" 
-$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(ALL_RTS_DEF_LIBS) rts/libs.depend rts/dist/build/$$(LIBFFI_DLL)
+$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(ALL_RTS_DEF_LIBS) rts/dist/libs.depend rts/dist/build/$$(LIBFFI_DLL)
 	"$$(RM)" $$(RM_OPTS) $$@
 	"$$(rts_dist_HC)" -package-name rts -shared -dynamic -dynload deploy \
 	  -no-auto-link-packages -Lrts/dist/build -l$$(LIBFFI_NAME) \
-	  `cat rts/libs.depend` $$(rts_$1_OBJS) $$(ALL_RTS_DEF_LIBS) -o $$@
+         `cat rts/dist/libs.depend` $$(rts_$1_OBJS) $$(ALL_RTS_DEF_LIBS) \
+         $$(rts_dist_$1_GHC_LD_OPTS) \
+         -o $$@
 else
 ifneq "$$(UseSystemLibFFI)" "YES"
 LIBFFI_LIBS = -Lrts/dist/build -l$$(LIBFFI_NAME)
 ifeq "$$(TargetElf)" "YES"
-LIBFFI_LIBS += -optl-Wl,-rpath -optl-Wl,'$$$$ORIGIN' -optl-Wl,-z -optl-Wl,origin
+LIBFFI_LIBS += -optl-Wl,-rpath -optl-Wl,'$$$$ORIGIN' -optl-Wl,-zorigin
+endif
+ifeq "$(TargetOS_CPP)" "darwin"
+LIBFFI_LIBS += -optl-Wl,-rpath -optl-Wl,@loader_path
 endif
 
 else
-# flags will be taken care of in rts/libs.depend
+# flags will be taken care of in rts/dist/libs.depend
 LIBFFI_LIBS =
 endif
-$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(rts_$1_DTRACE_OBJS) rts/libs.depend $$(rts_dist_FFI_SO)
+$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(rts_$1_DTRACE_OBJS) rts/dist/libs.depend $$(rts_dist_FFI_SO)
 	"$$(RM)" $$(RM_OPTS) $$@
 	"$$(rts_dist_HC)" -package-name rts -shared -dynamic -dynload deploy \
-	  -no-auto-link-packages $$(LIBFFI_LIBS) `cat rts/libs.depend` $$(rts_$1_OBJS) \
+	  -no-auto-link-packages $$(LIBFFI_LIBS) `cat rts/dist/libs.depend` $$(rts_$1_OBJS) \
+          $$(rts_dist_$1_GHC_LD_OPTS) \
 	  $$(rts_$1_DTRACE_OBJS) -o $$@
 endif
 else
@@ -301,6 +313,10 @@ ifeq "$(BeConservative)" "YES"
 rts_CC_OPTS += -DBE_CONSERVATIVE
 endif
 
+ifeq "$(TargetOS_CPP)" "HaLVM"
+rts_CC_OPTS += -nostdinc -Irts/minlibc/include -Irts/xen/include -Ilibraries/HALVMCore/cbits/include
+endif
+
 #-----------------------------------------------------------------------------
 # Flags for compiling specific files
 
@@ -331,10 +347,6 @@ rts/RtsUtils_CC_OPTS += -DTargetVendor=\"$(TargetVendor_CPP)\"
 #
 rts/RtsUtils_CC_OPTS += -DGhcUnregisterised=\"$(GhcUnregisterised)\"
 rts/RtsUtils_CC_OPTS += -DGhcEnableTablesNextToCode=\"$(GhcEnableTablesNextToCode)\"
-
-ifeq "$(DYNAMIC_GHC_PROGRAMS)" "YES"
-rts/Linker_CC_OPTS += -DDYNAMIC_GHC_PROGRAMS
-endif
 
 # Compile various performance-critical pieces *without* -fPIC -dynamic
 # even when building a shared library.  If we don't do this, then the
@@ -419,11 +431,13 @@ rts/win32/ThrIOManager_CC_OPTS += -w
 # The above warning supression flags are a temporary kludge.
 # While working on this module you are encouraged to remove it and fix
 # any warnings in the module. See
-#     http://hackage.haskell.org/trac/ghc/wiki/WorkingConventions#Warnings
+#     http://ghc.haskell.org/trac/ghc/wiki/WorkingConventions#Warnings
 # for details
 
 # Without this, thread_obj will not be inlined (at least on x86 with GCC 4.1.0)
+ifneq "$(CC_CLANG_BACKEND)" "1"
 rts/sm/Compact_CC_OPTS += -finline-limit=2500
+endif
 
 # -O3 helps unroll some loops (especially in copy() with a constant argument).
 rts/sm/Evac_CC_OPTS += -funroll-loops
@@ -546,6 +560,12 @@ endif
 
 ifeq "$(HaveLibMingwEx)" "YES"
 rts_PACKAGE_CPP_OPTS += -DHAVE_LIBMINGWEX
+endif
+
+ifeq "$(TargetOS_CPP)" "HaLVM"
+rts_PACKAGE_CPP_OPTS += -DHALVM_SYSTEM_INCLUDES=$(ghcheaderdir)/minlibc
+else
+rts_PACKAGE_CPP_OPTS += -DHALVM_SYSTEM_INCLUDES=
 endif
 
 $(eval $(call manual-package-config,rts))

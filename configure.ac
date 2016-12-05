@@ -13,10 +13,10 @@ dnl
 # see what flags are available. (Better yet, read the documentation!)
 #
 
-AC_INIT([The Glorious Glasgow Haskell Compilation System], [7.7], [glasgow-haskell-bugs@haskell.org], [ghc])
+AC_INIT([The Glorious Glasgow Haskell Compilation System], [7.8.4], [glasgow-haskell-bugs@haskell.org], [ghc])
 
 # Set this to YES for a released version, otherwise NO
-: ${RELEASE=NO}
+: ${RELEASE=YES}
 
 # The primary version (e.g. 7.5, 7.4.1) is set in the AC_INIT line
 # above.  If this is not a released version, then we will append the
@@ -34,7 +34,7 @@ fi
 AC_SUBST([CONFIGURE_ARGS], [$ac_configure_args])
 
 dnl ----------------------------------------------------------
-dnl ** Find unixy sort and find commands, 
+dnl ** Find unixy sort and find commands,
 dnl ** which are needed by FP_SETUP_PROJECT_VERSION
 
 dnl ** Find find command (for Win32's benefit)
@@ -91,7 +91,7 @@ AC_ARG_WITH([ghc],
   WithGhc="$GHC"])
 
 dnl ** Tell the make system which OS we are using
-dnl $OSTYPE is set by the operating system to "msys" or "cygwin" or something 
+dnl $OSTYPE is set by the operating system to "msys" or "cygwin" or something
 AC_SUBST(OSTYPE)
 
 AC_ARG_ENABLE(bootstrap-with-devel-snapshot,
@@ -156,6 +156,12 @@ FP_COMPARE_VERSIONS([$GhcVersion],[-lt],[7.5],
                     GHC_PACKAGE_DB_FLAG=package-db)
 AC_SUBST(GHC_PACKAGE_DB_FLAG)
 
+# GHC 7.7+ needs -fcmm-sink when compiling Parser.hs. See #8182
+FP_COMPARE_VERSIONS([$GhcVersion],[-gt],[7.7],
+                    CMM_SINK_BOOTSTRAP_IS_NEEDED=YES,
+                    CMM_SINK_BOOTSTRAP_IS_NEEDED=NO)
+AC_SUBST(CMM_SINK_BOOTSTRAP_IS_NEEDED)
+
 # GHC is passed to Cabal, so we need a native path
 if test "${WithGhc}" != ""
 then
@@ -177,6 +183,56 @@ AC_SUBST([WithGhc])
 
 dnl ** Without optimization some INLINE trickery fails for GHCi
 SRC_CC_OPTS="-O"
+
+dnl ** Bug 9439: Some GHC 7.8 releases had broken LLVM code generator.
+dnl Unfortunately we don't know whether the user is going to request a
+dnl build with the LLVM backend as this is only given in build.mk.
+dnl
+dnl Instead, we try to do as much work as possible here, checking
+dnl whether -fllvm is the stage 0 compiler's default. If so we
+dnl fail. If not, we check whether -fllvm is affected explicitly and
+dnl if so set a flag. The build system will later check this flag
+dnl after the desired build flags are known.
+AC_MSG_CHECKING(whether bootstrap compiler is affected by bug 9439)
+echo "main = putStrLn \"%function\"" > conftestghc.hs
+
+# Check whether LLVM backend is default for this platform
+${WithGhc} conftestghc.hs 2>&1 >/dev/null
+res=`./conftestghc`
+if test "x$res" = "x%object"
+then
+    AC_MSG_RESULT(yes)
+    echo "Buggy bootstrap compiler"
+    echo ""
+    echo "The stage 0 compiler $WithGhc is affected by GHC Bug \#9439"
+    echo "and therefore will miscompile the LLVM backend if -fllvm is"
+    echo "used."
+    echo
+    echo "Please use another bootstrap compiler"
+    exit 1
+fi
+
+# -fllvm is not the default, but set a flag so the Makefile can check
+# -for it in the build flags later on
+${WithGhc} -fforce-recomp -fllvm conftestghc.hs 2>&1 >/dev/null
+if test $? = 0
+then
+    res=`./conftestghc`
+    if test "x$res" = "x%object"
+    then
+        AC_MSG_RESULT(yes)
+        GHC_LLVM_AFFECTED_BY_9439=1
+    elif test "x$res" = "x%function"
+    then
+        AC_MSG_RESULT(no)
+        GHC_LLVM_AFFECTED_BY_9439=0
+    else
+        AC_MSG_WARN(unexpected output $res)
+    fi
+else
+    AC_MSG_RESULT(failed to compile, assuming no)
+fi
+AC_SUBST([GHC_LLVM_AFFECTED_BY_9439])
 
 dnl--------------------------------------------------------------------
 dnl * Choose host(/target/build) platform
@@ -328,6 +384,7 @@ then
     CC="${mingwbin}gcc.exe"
     LD="${mingwbin}ld.exe"
     NM="${mingwbin}nm.exe"
+    RANLIB="${mingwbin}ranlib.exe"
     OBJDUMP="${mingwbin}objdump.exe"
     fp_prog_ar="${mingwbin}ar.exe"
 
@@ -368,7 +425,7 @@ AC_ARG_WITH([ffi-includes],
     AC_MSG_WARN([--with-ffi-includes will be ignored, --with-system-libffi not set])
  else
     FFIIncludeDir="$withval"
-    LIBFFI_CFLAGS="-I $withval" 
+    LIBFFI_CFLAGS="-I$withval"
  fi
 ])
 
@@ -467,6 +524,66 @@ FIND_GCC([WhatGccIsCalled], [gcc], [gcc])
 CC="$WhatGccIsCalled"
 export CC
 
+# If --with-gcc was used, and we're not cross-compiling, then it also
+# applies to the stage0 compiler.
+MAYBE_OVERRIDE_STAGE0([gcc],[CC_STAGE0])
+MAYBE_OVERRIDE_STAGE0([ar],[AR_STAGE0])
+
+dnl ** what cpp to use?
+dnl --------------------------------------------------------------
+AC_ARG_WITH(hs-cpp,
+[AC_HELP_STRING([--with-hs-cpp=ARG],
+        [Use ARG as the path to cpp [default=autodetect]])],
+[
+    if test "$HostOS" = "mingw32"
+    then
+        AC_MSG_WARN([Request to use $withval will be ignored])
+    else
+        HaskellCPPCmd=$withval
+    fi
+],
+[
+        HaskellCPPCmd=$WhatGccIsCalled
+]
+)
+
+
+
+dnl ** what cpp flags to use?
+dnl -----------------------------------------------------------
+AC_ARG_WITH(hs-cpp-flags,
+  [AC_HELP_STRING([--with-hs-cpp-flags=ARG],
+          [Use ARG as the path to hs cpp [default=autodetect]])],
+  [
+      if test "$HostOS" = "mingw32"
+      then
+          AC_MSG_WARN([Request to use $withval will be ignored])
+      else
+          HaskellCPPArgs=$withval
+      fi
+  ],
+[
+  $HaskellCPPCmd -x c /dev/null -dM -E > conftest.txt 2>&1
+  if grep "__clang__" conftest.txt >/dev/null 2>&1; then
+    HaskellCPPArgs="-E -undef -traditional -Wno-invalid-pp-token -Wno-unicode -Wno-trigraphs "
+  else
+      $HaskellCPPCmd  -v > conftest.txt 2>&1
+      if  grep "gcc" conftest.txt >/dev/null 2>&1; then
+          HaskellCPPArgs="-E -undef -traditional "
+        else
+          $HaskellCPPCmd  --version > conftest.txt 2>&1
+          if grep "cpphs" conftest.txt >/dev/null 2>&1; then
+            HaskellCPPArgs="--cpp -traditional"
+          else
+            AC_MSG_WARN([configure can't recognize your CPP program, you may need to set --with-hs-cpp-flags=FLAGS explicitly])
+            HaskellCPPArgs=""
+          fi
+      fi
+  fi
+  ]
+)
+
+
 dnl ** Which ld to use?
 dnl --------------------------------------------------------------
 FP_ARG_WITH_PATH_GNU_PROG([LD], [ld], [ld])
@@ -478,6 +595,21 @@ dnl --------------------------------------------------------------
 FP_ARG_WITH_PATH_GNU_PROG([NM], [nm], [nm])
 NmCmd="$NM"
 AC_SUBST([NmCmd])
+
+dnl ** Which ar to use?
+dnl --------------------------------------------------------------
+FP_ARG_WITH_PATH_GNU_PROG([AR], [ar], [ar])
+ArCmd="$AR"
+fp_prog_ar="$AR"
+AC_SUBST([ArCmd])
+
+dnl ** Which ranlib to use?
+dnl --------------------------------------------------------------
+FP_ARG_WITH_PATH_GNU_PROG([RANLIB], [ranlib], [ranlib])
+RanlibCmd="$RANLIB"
+RANLIB="$RanlibCmd"
+AC_SUBST([RanlibCmd])
+
 
 # Note: we may not have objdump on OS X, and we only need it on Windows (for DLL checks)
 case $HostOS_CPP in
@@ -517,6 +649,9 @@ dnl --------------------------------------------------------------
 if test "$TargetOS" = "mingw32"
 then
     GhcLibsWithUnix=NO
+elif test "$TargetOS" = "HaLVM"
+then
+    GhcLibsWithUnix=NO
 else
     GhcLibsWithUnix=YES
 fi
@@ -553,8 +688,6 @@ dnl ** look to see if we have a C compiler using an llvm back end.
 dnl
 FP_CC_LLVM_BACKEND
 
-FP_PROG_LD_HashSize31
-FP_PROG_LD_ReduceMemoryOverheads
 FP_PROG_LD_IS_GNU
 FP_PROG_LD_BUILD_ID
 FP_PROG_LD_NO_COMPACT_UNWIND
@@ -564,8 +697,8 @@ FP_PROG_LD_FILELIST
 FPTOOLS_SET_C_LD_FLAGS([target],[CFLAGS],[LDFLAGS],[IGNORE_LINKER_LD_FLAGS],[CPPFLAGS])
 FPTOOLS_SET_C_LD_FLAGS([build],[CONF_CC_OPTS_STAGE0],[CONF_GCC_LINKER_OPTS_STAGE0],[CONF_LD_LINKER_OPTS_STAGE0],[CONF_CPP_OPTS_STAGE0])
 FPTOOLS_SET_C_LD_FLAGS([target],[CONF_CC_OPTS_STAGE1],[CONF_GCC_LINKER_OPTS_STAGE1],[CONF_LD_LINKER_OPTS_STAGE1],[CONF_CPP_OPTS_STAGE1])
-# Stage 3 won't be supported by cross-compilation
 FPTOOLS_SET_C_LD_FLAGS([target],[CONF_CC_OPTS_STAGE2],[CONF_GCC_LINKER_OPTS_STAGE2],[CONF_LD_LINKER_OPTS_STAGE2],[CONF_CPP_OPTS_STAGE2])
+# Stage 3 won't be supported by cross-compilation
 
 FP_GCC_EXTRA_FLAGS
 
@@ -676,7 +809,12 @@ dnl    off_t, because it will affect the result of that test.
 AC_SYS_LARGEFILE
 
 dnl ** check for specific header (.h) files that we are interested in
+if test "$TargetOS" = "HaLVM"
+then
+AC_CHECK_HEADERS([bfd.h ctype.h dirent.h dlfcn.h errno.h fcntl.h grp.h limits.h locale.h nlist.h pwd.h  sys/mman.h sys/resource.h sys/select.h sys/time.h sys/timeb.h sys/timers.h sys/times.h sys/utsname.h sys/wait.h termios.h time.h utime.h windows.h winsock.h sched.h])
+else
 AC_CHECK_HEADERS([bfd.h ctype.h dirent.h dlfcn.h errno.h fcntl.h grp.h limits.h locale.h nlist.h pthread.h pwd.h signal.h sys/param.h sys/mman.h sys/resource.h sys/select.h sys/time.h sys/timeb.h sys/timers.h sys/times.h sys/utsname.h sys/wait.h termios.h time.h utime.h windows.h winsock.h sched.h])
+fi
 
 dnl sys/cpuset.h needs sys/param.h to be included first on FreeBSD 9.1; #7708
 AC_CHECK_HEADERS([sys/cpuset.h], [], [],
@@ -786,7 +924,7 @@ dnl ** check for math library
 dnl    Keep that check as early as possible.
 dnl    as we need to know whether we need libm
 dnl    for math functions or not
-dnl    (see http://hackage.haskell.org/trac/ghc/ticket/3730)
+dnl    (see http://ghc.haskell.org/trac/ghc/ticket/3730)
 AC_CHECK_LIB(m, atan, HaveLibM=YES, HaveLibM=NO)
 if test $HaveLibM = YES
 then
@@ -804,12 +942,17 @@ dnl ################################################################
 
 dnl ** check whether we need -ldl to get dlopen()
 
+if test "$TargetOS" = "HaLVM"
+then
+HaveLibDL=NO
+else
 AC_CHECK_LIB(dl, dlopen,
     [HaveLibDL=YES
      AC_DEFINE([HAVE_LIBDL], [1], [Define to 1 if you need -ldl to get dlopen().])
      LIBS="$LIBS -ldl"],
     [HaveLibDL=NO])
 AC_SUBST(HaveLibDL)
+fi
 
 dnl --------------------------------------------------
 dnl * Miscellaneous feature tests
@@ -834,9 +977,12 @@ FP_LEADING_UNDERSCORE
 FP_VISIBILITY_HIDDEN
 
 dnl ** check for librt
+if test "$TargetOS" != "HaLVM"
+then
 AC_CHECK_LIB(rt, clock_gettime)
 AC_CHECK_FUNCS(clock_gettime timer_settime)
 FP_CHECK_TIMER_CREATE
+fi
 
 dnl ** check for Apple's "interesting" long double compatibility scheme
 AC_MSG_CHECKING(for printf\$LDBLStub)
@@ -856,7 +1002,21 @@ dnl ** check for eventfd which is needed by the I/O manager
 AC_CHECK_HEADERS([sys/eventfd.h])
 AC_CHECK_FUNCS([eventfd])
 
-# checking for PAPI
+dnl ** Check for __thread support in the compiler
+AC_MSG_CHECKING(for __thread support)
+AC_COMPILE_IFELSE(
+  [ AC_LANG_SOURCE([[__thread int tester = 0;]]) ],
+  [
+   AC_MSG_RESULT(yes)
+   AC_DEFINE([CC_SUPPORTS_TLS],[1],[Define to 1 if __thread is supported])
+  ],
+  [
+   AC_MSG_RESULT(no)
+   AC_DEFINE([CC_SUPPORTS_TLS],[0],[Define to 1 if __thread is supported])
+  ])
+
+
+dnl ** checking for PAPI
 AC_CHECK_LIB(papi, PAPI_library_init, HavePapiLib=YES, HavePapiLib=NO)
 AC_CHECK_HEADER([papi.h], [HavePapiHeader=YES], [HavePapiHeader=NO])
 AC_SUBST(HavePapiLib)
@@ -953,13 +1113,14 @@ echo ["\
    Using $CompilerName       : $WhatGccIsCalled
       which is version       : $GccVersion
    Building a cross compiler : $CrossCompiling
-
-   ld       : $LdCmd
-   Happy    : $HappyCmd ($HappyVersion)
-   Alex     : $AlexCmd ($AlexVersion)
-   Perl     : $PerlCmd
-   dblatex  : $DblatexCmd
-   xsltproc : $XsltprocCmd
+   cpp       : $HaskellCPPCmd
+   cpp-flags : $HaskellCPPArgs
+   ld        : $LdCmd
+   Happy     : $HappyCmd ($HappyVersion)
+   Alex      : $AlexCmd ($AlexVersion)
+   Perl      : $PerlCmd
+   dblatex   : $DblatexCmd
+   xsltproc  : $XsltprocCmd
 
    Using LLVM tools
       llc   : $LlcCmd
@@ -990,5 +1151,5 @@ To make changes to the default build configuration, copy the file
 mk/build.mk.sample to mk/build.mk, and edit the settings in there.
 
 For more information on how to configure your GHC build, see
-   http://hackage.haskell.org/trac/ghc/wiki/Building
+   http://ghc.haskell.org/trac/ghc/wiki/Building
 "

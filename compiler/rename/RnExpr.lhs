@@ -16,28 +16,24 @@ module RnExpr (
 
 #include "HsVersions.h"
 
-#ifdef GHCI
 import {-# SOURCE #-} TcSplice( runQuasiQuoteExpr )
-#endif  /* GHCI */
 
-import RnSource  ( rnSrcDecls, findSplice )
 import RnBinds   ( rnLocalBindsAndThen, rnLocalValBindsLHS, rnLocalValBindsRHS,
                    rnMatchGroup, rnGRHS, makeMiniFixityEnv)
 import HsSyn
 import TcRnMonad
-import TcEnv            ( thRnBrack )
+import Module           ( getModule )
 import RnEnv
+import RnSplice         ( rnBracket, rnSpliceExpr, checkThLocalName )
 import RnTypes
 import RnPat
 import DynFlags
 import BasicTypes       ( FixityDirection(..) )
 import PrelNames
 
-import Module
 import Name
 import NameSet
 import RdrName
-import LoadIface        ( loadInterfaceForName )
 import UniqSet
 import Data.List
 import Util
@@ -95,7 +91,11 @@ finishHsVar :: Name -> RnM (HsExpr Name, FreeVars)
 -- when renaming infix expressions
 -- See Note [Adding the implicit parameter to 'assert']
 finishHsVar name
- = do { ignore_asserts <- goptM Opt_IgnoreAsserts
+ = do { this_mod <- getModule
+      ; when (nameIsLocalOrFrom this_mod name) $
+        checkThLocalName name
+
+      ; ignore_asserts <- goptM Opt_IgnoreAsserts
       ; if ignore_asserts || not (name `hasKey` assertIdKey)
         then return (HsVar name, unitFV name)
         else do { e <- mkAssertErrorExpr
@@ -104,7 +104,7 @@ finishHsVar name
 rnExpr (HsVar v)
   = do { mb_name <- lookupOccRn_maybe v
        ; case mb_name of {
-           Nothing -> do { opt_TypeHoles <- xoptM Opt_TypeHoles
+           Nothing -> do { opt_TypeHoles <- woptM Opt_WarnTypedHoles
                          ; if opt_TypeHoles && startsWithUnderscore (rdrNameOcc v)
                            then return (HsUnboundVar v, emptyFVs)
                            else do { n <- reportUnboundName v; finishHsVar n } } ;
@@ -112,8 +112,9 @@ rnExpr (HsVar v)
               | name == nilDataConName -- Treat [] as an ExplicitList, so that
                                        -- OverloadedLists works correctly
               -> rnExpr (ExplicitList placeHolderType Nothing [])
+
               | otherwise
-              -> finishHsVar name } }
+              -> finishHsVar name }}
 
 rnExpr (HsIPVar v)
   = return (HsIPVar v, emptyFVs)
@@ -171,27 +172,16 @@ rnExpr (NegApp e _)
 -- Template Haskell extensions
 -- Don't ifdef-GHCI them because we want to fail gracefully
 -- (not with an rnExpr crash) in a stage-1 compiler.
-rnExpr e@(HsBracket br_body)
-  = do
-    thEnabled <- xoptM Opt_TemplateHaskell
-    unless thEnabled $
-      failWith ( vcat [ ptext (sLit "Syntax error on") <+> ppr e
-                      , ptext (sLit "Perhaps you intended to use -XTemplateHaskell") ] )
-    checkTH e "bracket"
-    (body', fvs_e) <- rnBracket br_body
-    return (HsBracket body', fvs_e)
+rnExpr e@(HsBracket br_body) = rnBracket e br_body
 
-rnExpr (HsSpliceE splice)
-  = rnSplice splice             `thenM` \ (splice', fvs) ->
-    return (HsSpliceE splice', fvs)
+rnExpr (HsSpliceE is_typed splice) = rnSpliceExpr is_typed splice
 
-#ifndef GHCI
-rnExpr e@(HsQuasiQuoteE _) = pprPanic "Cant do quasiquotation without GHCi" (ppr e)
-#else
+
 rnExpr (HsQuasiQuoteE qq)
-  = runQuasiQuoteExpr qq        `thenM` \ (L _ expr') ->
-    rnExpr expr'
-#endif  /* GHCI */
+  = runQuasiQuoteExpr qq        `thenM` \ lexpr' ->
+    -- Wrap the result of the quasi-quoter in parens so that we don't
+    -- lose the outermost location set by runQuasiQuote (#7918) 
+    rnExpr (HsPar lexpr')
 
 ---------------------------------------------
 --      Sections
@@ -323,7 +313,7 @@ Since all the symbols are reservedops we can simply reject them.
 We return a (bogus) EWildPat in each case.
 
 \begin{code}
-rnExpr e@EWildPat      = do { holes <- xoptM Opt_TypeHoles
+rnExpr e@EWildPat      = do { holes <- woptM Opt_WarnTypedHoles
                             ; if holes
                                 then return (hsHoleExpr, emptyFVs)
                                 else patSynErr e
@@ -611,60 +601,6 @@ rnArithSeq (FromThenTo expr1 expr2 expr3)
 
 %************************************************************************
 %*                                                                      *
-        Template Haskell brackets
-%*                                                                      *
-%************************************************************************
-
-\begin{code}
-rnBracket :: HsBracket RdrName -> RnM (HsBracket Name, FreeVars)
-rnBracket (VarBr flg n)
-  = do { name <- lookupOccRn n
-       ; this_mod <- getModule
-       ; unless (nameIsLocalOrFrom this_mod name) $  -- Reason: deprecation checking assumes
-         do { _ <- loadInterfaceForName msg name     -- the home interface is loaded, and
-            ; return () }                            -- this is the only way that is going
-                                                     -- to happen
-       ; return (VarBr flg name, unitFV name) }
-  where
-    msg = ptext (sLit "Need interface for Template Haskell quoted Name")
-
-rnBracket (ExpBr e) = do { (e', fvs) <- rnLExpr e
-                         ; return (ExpBr e', fvs) }
-
-rnBracket (PatBr p) = rnPat ThPatQuote p $ \ p' -> return (PatBr p', emptyFVs)
-
-rnBracket (TypBr t) = do { (t', fvs) <- rnLHsType TypBrCtx t
-                         ; return (TypBr t', fvs) }
-
-rnBracket (DecBrL decls)
-  = do { (group, mb_splice) <- findSplice decls
-       ; case mb_splice of
-           Nothing -> return ()
-           Just (SpliceDecl (L loc _) _, _)
-              -> setSrcSpan loc $
-                 addErr (ptext (sLit "Declaration splices are not permitted inside declaration brackets"))
-                -- Why not?  See Section 7.3 of the TH paper.
-
-       ; gbl_env  <- getGblEnv
-       ; let new_gbl_env = gbl_env { tcg_dus = emptyDUs }
-                          -- The emptyDUs is so that we just collect uses for this
-                          -- group alone in the call to rnSrcDecls below
-       ; (tcg_env, group') <- setGblEnv new_gbl_env $
-                              setStage thRnBrack $
-                              rnSrcDecls [] group
-   -- The empty list is for extra dependencies coming from .hs-boot files
-   -- See Note [Extra dependencies from .hs-boot files] in RnSource
-
-              -- Discard the tcg_env; it contains only extra info about fixity
-        ; traceRn (text "rnBracket dec" <+> (ppr (tcg_dus tcg_env) $$
-                   ppr (duUses (tcg_dus tcg_env))))
-        ; return (DecBrG group', duUses (tcg_dus tcg_env)) }
-
-rnBracket (DecBrG _) = panic "rnBracket: unexpected DecBrG"
-\end{code}
-
-%************************************************************************
-%*                                                                      *
 \subsubsection{@Stmt@s: in @do@ expressions}
 %*                                                                      *
 %************************************************************************
@@ -755,7 +691,13 @@ rnStmt _ _ (L loc (LetStmt binds)) thing_inside
         ; return (([L loc (LetStmt binds')], thing), fvs) }  }
 
 rnStmt ctxt rnBody (L _ (RecStmt { recS_stmts = rec_stmts })) thing_inside
-  = do  {
+  = do  { (return_op, fvs1)  <- lookupStmtName ctxt returnMName
+        ; (mfix_op,   fvs2)  <- lookupStmtName ctxt mfixName
+        ; (bind_op,   fvs3)  <- lookupStmtName ctxt bindMName
+        ; let empty_rec_stmt = emptyRecStmt { recS_ret_fn  = return_op
+                                            , recS_mfix_fn = mfix_op
+                                            , recS_bind_fn = bind_op }
+
         -- Step1: Bring all the binders of the mdo into scope
         -- (Remember that this also removes the binders from the
         -- finally-returned free-vars.)
@@ -766,35 +708,10 @@ rnStmt ctxt rnBody (L _ (RecStmt { recS_stmts = rec_stmts })) thing_inside
         -- (This set may not be empty, because we're in a recursive
         -- context.)
         ; rnRecStmtsAndThen rnBody rec_stmts   $ \ segs -> do
-
         { let bndrs = nameSetToList $ foldr (unionNameSets . (\(ds,_,_,_) -> ds))
                                             emptyNameSet segs
         ; (thing, fvs_later) <- thing_inside bndrs
-        ; (return_op, fvs1)  <- lookupStmtName ctxt returnMName
-        ; (mfix_op,   fvs2)  <- lookupStmtName ctxt mfixName
-        ; (bind_op,   fvs3)  <- lookupStmtName ctxt bindMName
-        ; let
-                -- Step 2: Fill in the fwd refs.
-                --         The segments are all singletons, but their fwd-ref
-                --         field mentions all the things used by the segment
-                --         that are bound after their use
-            segs_w_fwd_refs          = addFwdRefs segs
-
-                -- Step 3: Group together the segments to make bigger segments
-                --         Invariant: in the result, no segment uses a variable
-                --                    bound in a later segment
-            grouped_segs = glomSegments ctxt segs_w_fwd_refs
-
-                -- Step 4: Turn the segments into Stmts
-                --         Use RecStmt when and only when there are fwd refs
-                --         Also gather up the uses from the end towards the
-                --         start, so we can tell the RecStmt which things are
-                --         used 'after' the RecStmt
-            empty_rec_stmt = emptyRecStmt { recS_ret_fn  = return_op
-                                          , recS_mfix_fn = mfix_op
-                                          , recS_bind_fn = bind_op }
-            (rec_stmts', fvs) = segsToStmts empty_rec_stmt grouped_segs fvs_later
-
+        ; let (rec_stmts', fvs) = segmentRecStmts ctxt empty_rec_stmt segs fvs_later
         ; return ((rec_stmts', thing), fvs `plusFV` fvs1 `plusFV` fvs2 `plusFV` fvs3) } }
 
 rnStmt ctxt _ (L loc (ParStmt segs _ _)) thing_inside
@@ -1091,13 +1008,51 @@ rn_rec_stmts rnBody bndrs stmts =
     return (concat segs_s)
 
 ---------------------------------------------
+segmentRecStmts :: HsStmtContext Name 
+                -> Stmt Name body
+                -> [Segment (LStmt Name body)] -> FreeVars
+                -> ([LStmt Name body], FreeVars)
+
+segmentRecStmts ctxt empty_rec_stmt segs fvs_later
+  | MDoExpr <- ctxt
+  = segsToStmts empty_rec_stmt grouped_segs fvs_later
+                -- Step 4: Turn the segments into Stmts
+                --         Use RecStmt when and only when there are fwd refs
+                --         Also gather up the uses from the end towards the
+                --         start, so we can tell the RecStmt which things are
+                --         used 'after' the RecStmt
+
+  | otherwise
+  = ([ L (getLoc (head ss)) $
+       empty_rec_stmt { recS_stmts = ss
+                      , recS_later_ids = nameSetToList (defs `intersectNameSet` fvs_later)
+                      , recS_rec_ids   = nameSetToList (defs `intersectNameSet` uses) }]
+    , uses `plusFV` fvs_later)
+
+  where
+    (defs_s, uses_s, _, ss) = unzip4 segs
+    defs = plusFVs defs_s
+    uses = plusFVs uses_s
+
+                -- Step 2: Fill in the fwd refs.
+                --         The segments are all singletons, but their fwd-ref
+                --         field mentions all the things used by the segment
+                --         that are bound after their use
+    segs_w_fwd_refs = addFwdRefs segs
+
+                -- Step 3: Group together the segments to make bigger segments
+                --         Invariant: in the result, no segment uses a variable
+                --                    bound in a later segment
+    grouped_segs = glomSegments ctxt segs_w_fwd_refs
+
+----------------------------
 addFwdRefs :: [Segment a] -> [Segment a]
 -- So far the segments only have forward refs *within* the Stmt
 --      (which happens for bind:  x <- ...x...)
 -- This function adds the cross-seg fwd ref info
 
-addFwdRefs pairs
-  = fst (foldr mk_seg ([], emptyNameSet) pairs)
+addFwdRefs segs
+  = fst (foldr mk_seg ([], emptyNameSet) segs)
   where
     mk_seg (defs, uses, fwds, stmts) (segs, later_defs)
         = (new_seg : segs, all_defs)
@@ -1106,48 +1061,53 @@ addFwdRefs pairs
           all_defs = later_defs `unionNameSets` defs
           new_fwds = fwds `unionNameSets` (uses `intersectNameSet` later_defs)
                 -- Add the downstream fwd refs here
+\end{code}
 
-----------------------------------------------------
---      Glomming the singleton segments of an mdo into
---      minimal recursive groups.
---
--- At first I thought this was just strongly connected components, but
--- there's an important constraint: the order of the stmts must not change.
---
--- Consider
---      mdo { x <- ...y...
---            p <- z
---            y <- ...x...
---            q <- x
---            z <- y
---            r <- x }
---
--- Here, the first stmt mention 'y', which is bound in the third.
--- But that means that the innocent second stmt (p <- z) gets caught
--- up in the recursion.  And that in turn means that the binding for
--- 'z' has to be included... and so on.
---
--- Start at the tail { r <- x }
--- Now add the next one { z <- y ; r <- x }
--- Now add one more     { q <- x ; z <- y ; r <- x }
--- Now one more... but this time we have to group a bunch into rec
---      { rec { y <- ...x... ; q <- x ; z <- y } ; r <- x }
--- Now one more, which we can add on without a rec
---      { p <- z ;
---        rec { y <- ...x... ; q <- x ; z <- y } ;
---        r <- x }
--- Finally we add the last one; since it mentions y we have to
--- glom it togeher with the first two groups
---      { rec { x <- ...y...; p <- z ; y <- ...x... ;
---              q <- x ; z <- y } ;
---        r <- x }
---
--- NB. June 7 2012: We only glom segments that appear in
--- an explicit mdo; and leave those found in "do rec"'s intact.
--- See http://hackage.haskell.org/trac/ghc/ticket/4148 for
--- the discussion leading to this design choice.
+Note [Segmenting mdo]
+~~~~~~~~~~~~~~~~~~~~~
+NB. June 7 2012: We only glom segments that appear in an explicit mdo;
+and leave those found in "do rec"'s intact.  See
+http://ghc.haskell.org/trac/ghc/ticket/4148 for the discussion
+leading to this design choice.  Hence the test in segmentRecStmts.
 
+Note [Glomming segments]
+~~~~~~~~~~~~~~~~~~~~~~~~
+Glomming the singleton segments of an mdo into minimal recursive groups.
+
+At first I thought this was just strongly connected components, but
+there's an important constraint: the order of the stmts must not change.
+
+Consider
+     mdo { x <- ...y...
+           p <- z
+           y <- ...x...
+           q <- x
+           z <- y
+           r <- x }
+
+Here, the first stmt mention 'y', which is bound in the third.
+But that means that the innocent second stmt (p <- z) gets caught
+up in the recursion.  And that in turn means that the binding for
+'z' has to be included... and so on.
+
+Start at the tail { r <- x }
+Now add the next one { z <- y ; r <- x }
+Now add one more     { q <- x ; z <- y ; r <- x }
+Now one more... but this time we have to group a bunch into rec
+     { rec { y <- ...x... ; q <- x ; z <- y } ; r <- x }
+Now one more, which we can add on without a rec
+     { p <- z ;
+       rec { y <- ...x... ; q <- x ; z <- y } ;
+       r <- x }
+Finally we add the last one; since it mentions y we have to
+glom it together with the first two groups
+     { rec { x <- ...y...; p <- z ; y <- ...x... ;
+             q <- x ; z <- y } ;
+       r <- x }
+
+\begin{code}
 glomSegments :: HsStmtContext Name -> [Segment (LStmt Name body)] -> [Segment [LStmt Name body]]
+-- See Note [Glomming segments]
 
 glomSegments _ [] = []
 glomSegments ctxt ((defs,uses,fwds,stmt) : segs)
@@ -1172,10 +1132,7 @@ glomSegments ctxt ((defs,uses,fwds,stmt) : segs)
         = (reverse yeses, reverse noes)
         where
           (noes, yeses)           = span not_needed (reverse dus)
-          not_needed (defs,_,_,_) = case ctxt of
-                                      MDoExpr -> not (intersectsNameSet defs uses)
-                                      _       -> False  -- unless we're in mdo, we *need* everything
-
+          not_needed (defs,_,_,_) = not (intersectsNameSet defs uses)
 
 ----------------------------------------------------
 segsToStmts :: Stmt Name body                   -- A RecStmt with the SyntaxOps filled in
@@ -1348,7 +1305,7 @@ okDoStmt dflags ctxt stmt
        RecStmt {}
          | Opt_RecursiveDo `xopt` dflags -> isOK
          | ArrowExpr <- ctxt -> isOK    -- Arrows allows 'rec'
-         | otherwise         -> Just (ptext (sLit "Use -XRecursiveDo"))
+         | otherwise         -> Just (ptext (sLit "Use RecursiveDo"))
        BindStmt {} -> isOK
        LetStmt {}  -> isOK
        BodyStmt {} -> isOK
@@ -1362,10 +1319,10 @@ okCompStmt dflags _ stmt
        BodyStmt {} -> isOK
        ParStmt {}
          | Opt_ParallelListComp `xopt` dflags -> isOK
-         | otherwise -> Just (ptext (sLit "Use -XParallelListComp"))
+         | otherwise -> Just (ptext (sLit "Use ParallelListComp"))
        TransStmt {}
          | Opt_TransformListComp `xopt` dflags -> isOK
-         | otherwise -> Just (ptext (sLit "Use -XTransformListComp"))
+         | otherwise -> Just (ptext (sLit "Use TransformListComp"))
        RecStmt {}  -> notOK
        LastStmt {} -> notOK  -- Should not happen (dealt with by checkLastStmt)
 
@@ -1377,7 +1334,7 @@ okPArrStmt dflags _ stmt
        BodyStmt {} -> isOK
        ParStmt {}
          | Opt_ParallelListComp `xopt` dflags -> isOK
-         | otherwise -> Just (ptext (sLit "Use -XParallelListComp"))
+         | otherwise -> Just (ptext (sLit "Use ParallelListComp"))
        TransStmt {} -> notOK
        RecStmt {}   -> notOK
        LastStmt {}  -> notOK  -- Should not happen (dealt with by checkLastStmt)
@@ -1388,7 +1345,7 @@ checkTupleSection args
   = do  { tuple_section <- xoptM Opt_TupleSections
         ; checkErr (all tupArgPresent args || tuple_section) msg }
   where
-    msg = ptext (sLit "Illegal tuple section: use -XTupleSections")
+    msg = ptext (sLit "Illegal tuple section: use TupleSections")
 
 ---------
 sectionErr :: HsExpr RdrName -> SDoc

@@ -262,12 +262,8 @@ initEra(Census *census)
 STATIC_INLINE void
 freeEra(Census *census)
 {
-    if (RtsFlags.ProfFlags.bioSelector != NULL)
-        // when bioSelector==NULL, these are freed in heapCensus()
-    {
-        arenaFree(census->arena);
-        freeHashTable(census->hash, NULL);
-    }
+    arenaFree(census->arena);
+    freeHashTable(census->hash, NULL);
 }
 
 /* --------------------------------------------------------------------------
@@ -335,16 +331,17 @@ void initProfiling2 (void)
     /* Initialise the log file name */
     hp_filename = stgMallocBytes(strlen(prog) + 6, "hpFileName");
     sprintf(hp_filename, "%s.hp", prog);
-    
+
     /* open the log file */
     if ((hp_file = fopen(hp_filename, "w")) == NULL) {
-      debugBelch("Can't open profiling report file %s\n", 
+      debugBelch("Can't open profiling report file %s\n",
 	      hp_filename);
       RtsFlags.ProfFlags.doHeapProfile = 0;
+      stgFree(prog);
       return;
     }
   }
-  
+
   stgFree(prog);
 
   initHeapProfiling();
@@ -467,8 +464,12 @@ endHeapProfiling(void)
 #ifdef PROFILING
     if (doingLDVProfiling()) {
         nat t;
-        for (t = 1; t <= era; t++) {
-            freeEra( &censuses[t] );
+        if (RtsFlags.ProfFlags.bioSelector != NULL) {
+            for (t = 1; t <= era; t++) {
+                freeEra( &censuses[t] );
+            }
+        } else {
+            freeEra( &censuses[era] );
         }
     } else {
         freeEra( &censuses[0] );
@@ -1125,8 +1126,7 @@ void heapCensus (Time t)
 #ifdef PROFILING
   if (RtsFlags.ProfFlags.bioSelector == NULL)
   {
-      freeHashTable( census->hash, NULL/* don't free the elements */ );
-      arenaFree( census->arena );
+      freeEra(census);
       census->hash = NULL;
       census->arena = NULL;
   }

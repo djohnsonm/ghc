@@ -13,7 +13,7 @@
  * DerivedConstants.h by a C program (mkDerivedConstantsHdr).
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
  *
  * -------------------------------------------------------------------------- */
 
@@ -84,7 +84,7 @@
 #define MAX_FLOAT_REG   6
 #define MAX_DOUBLE_REG  6
 #define MAX_LONG_REG    1
-#define MAX_SSE_REG     6
+#define MAX_XMM_REG     6
 
 /* -----------------------------------------------------------------------------
    Semi-Tagging constants
@@ -202,6 +202,7 @@
  */
 #define NotBlocked          0
 #define BlockedOnMVar       1
+#define BlockedOnMVarRead   14 /* TODO: renumber me, see #9003 */
 #define BlockedOnBlackHole  2
 #define BlockedOnRead       3
 #define BlockedOnWrite      4
@@ -227,6 +228,8 @@
 /* The thread is not on any run queues, but can be woken up
    by tryWakeupThread() */
 #define ThreadMigrating     13
+
+/* WARNING WARNING top number is BlockedOnMVarRead 14, not 13!! */
 
 /*
  * These constants are returned to the scheduler by a thread that has

@@ -912,8 +912,11 @@ genCCall' _ _ (PrimTarget MO_WriteBarrier) _ _
 genCCall' _ _ (PrimTarget MO_Touch) _ _
  = return $ nilOL
 
+genCCall' _ _ (PrimTarget (MO_Prefetch_Data _)) _ _
+ = return $ nilOL
+
 genCCall' dflags gcp target dest_regs args0
-  = ASSERT (not $ any (`elem` [II16]) $ map cmmTypeSize argReps)
+  = ASSERT(not $ any (`elem` [II16]) $ map cmmTypeSize argReps)
         -- we rely on argument promotion in the codeGen
     do
         (finalStack,passArgumentsCode,usedRegs) <- passArguments
@@ -1155,6 +1158,7 @@ genCCall' dflags gcp target dest_regs args0
                     MO_Memset    -> (fsLit "memset", False)
                     MO_Memmove   -> (fsLit "memmove", False)
 
+                    MO_BSwap w   -> (fsLit $ bSwapLabel w, False)
                     MO_PopCnt w  -> (fsLit $ popCntLabel w, False)
 
                     MO_S_QuotRem {}  -> unsupported
@@ -1164,7 +1168,7 @@ genCCall' dflags gcp target dest_regs args0
                     MO_U_Mul2 {}     -> unsupported
                     MO_WriteBarrier  -> unsupported
                     MO_Touch         -> unsupported
-                    MO_Prefetch_Data -> unsupported
+                    (MO_Prefetch_Data _ ) -> unsupported
                 unsupported = panic ("outOfLineCmmOp: " ++ show mop
                                   ++ " not supported")
 

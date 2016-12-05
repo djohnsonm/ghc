@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Modifying
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -28,7 +28,14 @@
 # libraries/base_dist_CC_OPTS = -Iinclude ...
 # libraries/base_dist_LD_OPTS = -package ghc-prim-0.1.0.0
 
+
+# Stage1Only => ("compiler" => stage == 0) \/ (stage == 0 \/ stage == 1)
+build-package-cond = $(if $(findstring $(Stage1Only),YES),$(if $(findstring $1,"compiler"),$(if $(findstring $2,0),YES,NO),$(if $(findstring $2,0 1),YES,NO)),YES)
+
 define build-package
+
+ifeq "$$(call build-package-cond,$1,$3)" "YES"
+
 $(call trace, build-package($1,$2,$3))
 $(call profStart, build-package($1,$2,$3))
 # $1 = dir
@@ -52,6 +59,9 @@ ifneq "$$($1_$2_NOT_NEEDED)" "YES"
 $$(eval $$(call build-package-helper,$1,$2,$3))
 endif
 $(call profEnd, build-package($1,$2,$3))
+
+endif
+
 endef
 
 

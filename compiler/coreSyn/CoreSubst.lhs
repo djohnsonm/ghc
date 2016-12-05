@@ -10,7 +10,7 @@ Utility functions on @Core@ syntax
 -- The above warning supression flag is a temporary kludge.
 -- While working on this module you are encouraged to remove it and
 -- detab the module (please do the detabbing in a separate patch). See
---     http://hackage.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
 -- for details
 
 module CoreSubst (
@@ -22,8 +22,8 @@ module CoreSubst (
 	deShadowBinds, substSpec, substRulesForImportedIds,
 	substTy, substCo, substExpr, substExprSC, substBind, substBindSC,
         substUnfolding, substUnfoldingSC,
-	substUnfoldingSource, lookupIdSubst, lookupTvSubst, lookupCvSubst, substIdOcc,
-        substTickish,
+	lookupIdSubst, lookupTvSubst, lookupCvSubst, substIdOcc,
+        substTickish, substVarSet,
 
         -- ** Operations on substitutions
 	emptySubst, mkEmptySubst, mkSubst, mkOpenSubst, substInScope, isEmptySubst, 
@@ -289,7 +289,7 @@ delBndr (Subst in_scope ids tvs cvs) v
 delBndrs :: Subst -> [Var] -> Subst
 delBndrs (Subst in_scope ids tvs cvs) vs
   = Subst in_scope (delVarEnvList ids vs) (delVarEnvList tvs vs) (delVarEnvList cvs vs)
-      -- Easist thing is just delete all from all!
+      -- Easiest thing is just delete all from all!
 
 -- | Simultaneously substitute for a bunch of variables
 --   No left-right shadowing
@@ -665,35 +665,12 @@ substUnfolding subst unf@(CoreUnfolding { uf_tmpl = tmpl, uf_src = src })
   | not (isStableSource src)  -- Zap an unstable unfolding, to save substitution work
   = NoUnfolding
   | otherwise                 -- But keep a stable one!
-  = seqExpr new_tmpl `seq` 
-    new_src `seq`
-    unf { uf_tmpl = new_tmpl, uf_src = new_src }
+  = seqExpr new_tmpl `seq`
+    unf { uf_tmpl = new_tmpl }
   where
     new_tmpl = substExpr (text "subst-unf") subst tmpl
-    new_src  = substUnfoldingSource subst src
 
 substUnfolding _ unf = unf	-- NoUnfolding, OtherCon
-
--------------------
-substUnfoldingSource :: Subst -> UnfoldingSource -> UnfoldingSource
-substUnfoldingSource (Subst in_scope ids _ _) (InlineWrapper wkr)
-  | Just wkr_expr <- lookupVarEnv ids wkr 
-  = case wkr_expr of
-      Var w1 -> InlineWrapper w1
-      _other -> -- WARN( True, text "Interesting! CoreSubst.substWorker1:" <+> ppr wkr 
-                --             <+> ifPprDebug (equals <+> ppr wkr_expr) )   
-			      -- Note [Worker inlining]
-                InlineStable  -- It's not a wrapper any more, but still inline it!
-
-  | Just w1  <- lookupInScope in_scope wkr = InlineWrapper w1
-  | otherwise = -- WARN( True, text "Interesting! CoreSubst.substWorker2:" <+> ppr wkr )
-    	      	-- This can legitimately happen.  The worker has been inlined and
-		-- dropped as dead code, because we don't treat the UnfoldingSource
-		-- as an "occurrence".
-                -- Note [Worker inlining]
-      	        InlineStable
-
-substUnfoldingSource _ src = src
 
 ------------------
 substIdOcc :: Subst -> Id -> Id
@@ -792,7 +769,7 @@ Note [Worker inlining]
 A worker can get sustituted away entirely.
 	- it might be trivial
 	- it might simply be very small
-We do not treat an InlWrapper as an 'occurrence' in the occurence 
+We do not treat an InlWrapper as an 'occurrence' in the occurrence 
 analyser, so it's possible that the worker is not even in scope any more.
 
 In all all these cases we simply drop the special case, returning to
@@ -866,7 +843,7 @@ simpleOptExpr :: CoreExpr -> CoreExpr
 -- We also inline bindings that bind a Eq# box: see
 -- See Note [Optimise coercion boxes agressively].
 --
--- The result is NOT guaranteed occurence-analysed, because
+-- The result is NOT guaranteed occurrence-analysed, because
 -- in  (let x = y in ....) we substitute for x; so y's occ-info
 -- may change radically
 
@@ -1163,7 +1140,7 @@ data ConCont = CC [CoreExpr] Coercion
 -- where t1..tk are the *universally-qantified* type args of 'dc'
 exprIsConApp_maybe :: InScopeEnv -> CoreExpr -> Maybe (DataCon, [Type], [CoreExpr])
 exprIsConApp_maybe (in_scope, id_unf) expr
-  = go (Left in_scope) expr (CC [] (mkReflCo (exprType expr)))
+  = go (Left in_scope) expr (CC [] (mkReflCo Representational (exprType expr)))
   where
     go :: Either InScopeSet Subst 
        -> CoreExpr -> ConCont 
@@ -1252,9 +1229,11 @@ dealWithCoercion co dc dc_args
 
         -- Make the "theta" from Fig 3 of the paper
         gammas = decomposeCo tc_arity co
-        theta_subst = liftCoSubstWith 
+        theta_subst = liftCoSubstWith Representational
                          (dc_univ_tyvars ++ dc_ex_tyvars)
-                         (gammas         ++ map mkReflCo (stripTypeArgs ex_args))
+                                                -- existentials are at role N
+                         (gammas         ++ map (mkReflCo Nominal)
+                                                (stripTypeArgs ex_args))
 
           -- Cast the value arguments (which include dictionaries)
         new_val_args = zipWith cast_arg arg_tys val_args
