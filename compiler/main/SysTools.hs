@@ -516,7 +516,7 @@ readProcessEnvWithExitCode
     -> IO (ExitCode, String, String) -- ^ (exit_code, stdout, stderr)
 readProcessEnvWithExitCode prog args env_update = do
     putStrLn "Printing program path"
-    putStrLn pgm
+    putStrLn prog
     putStrLn "Printing program args"
     print args
     putStrLn "Printing environment to override"
@@ -834,7 +834,7 @@ getLinkerInfo' dflags = do
             putStrLn "printing stde"
             putStrLn _stde
             putStrLn "printing exit code"
-            putStrLn _exitc
+            print _exitc
             fail "invalid --version output, or linker is unsupported"
 
   -- Process the executable call
