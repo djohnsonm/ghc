@@ -830,9 +830,9 @@ getLinkerInfo' dflags = do
          -- Unknown linker.
         | otherwise = do
             putStrLn "printing stdo"
-            putStrLn stdo
+            mapM_ putStrLn stdo
             putStrLn "printing stde"
-            putStrLn _stde
+            mapM_ putStrLn _stde
             putStrLn "printing exit code"
             print _exitc
             fail "invalid --version output, or linker is unsupported"
@@ -882,6 +882,8 @@ getLinkerInfo' dflags = do
                  -- of processing easier. In particular, 'clang' and 'gcc'
                  -- have slightly different outputs for '-Wl,--version', but
                  -- it's still easy to figure out.
+                 putStrLn "print args3"
+                 mapM_ putStrLn args3
                  parseLinkerInfo (lines stdo) (lines stde) exitc
             )
             (\err -> do
