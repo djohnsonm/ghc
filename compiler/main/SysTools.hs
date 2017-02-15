@@ -515,6 +515,12 @@ readProcessEnvWithExitCode
     -> [(String, String)] -- ^ environment to override
     -> IO (ExitCode, String, String) -- ^ (exit_code, stdout, stderr)
 readProcessEnvWithExitCode prog args env_update = do
+    putStrLn "Printing program path"
+    putStrLn pgm
+    putStrLn "Printing program args"
+    print args
+    putStrLn "Printing environment to override"
+    print env_update
     current_env <- getEnvironment
     let new_env = env_update ++ [ (k, v)
                                 | let overriden_keys = map fst env_update
@@ -822,7 +828,14 @@ getLinkerInfo' dflags = do
           return (GnuGold [Option "-Wl,--no-as-needed"])
 
          -- Unknown linker.
-        | otherwise = fail "invalid --version output, or linker is unsupported"
+        | otherwise = do
+            putStrLn "printing stdo"
+            putStrLn stdo
+            putStrLn "printing stde"
+            putStrLn _stde
+            putStrLn "printing exit code"
+            putStrLn _exitc
+            fail "invalid --version output, or linker is unsupported"
 
   -- Process the executable call
   info <- catchIO (do
